@@ -1,0 +1,48 @@
+symbols jazz.noi
+run 60
+hold start
+run 3
+hold none
+run 60
+hold right
+run 10
+print 0xC000 s16
+print 0xC002 s16
+print 0xC008 s16
+print 0xC00A s16
+print 0xC00F w1
+hold right
+run 10
+print 0xC000 s16
+print 0xC002 s16
+print 0xC008 s16
+print 0xC00A s16
+print 0xC00F w1
+hold right
+run 10
+print 0xC000 s16
+print 0xC002 s16
+print 0xC008 s16
+print 0xC00A s16
+print 0xC00F w1
+hold right
+run 10
+print 0xC000 s16
+print 0xC002 s16
+print 0xC008 s16
+print 0xC00A s16
+print 0xC00F w1
+hold right
+run 10
+print 0xC000 s16
+print 0xC002 s16
+print 0xC008 s16
+print 0xC00A s16
+print 0xC00F w1
+hold right
+run 10
+print 0xC000 s16
+print 0xC002 s16
+print 0xC008 s16
+print 0xC00A s16
+print 0xC00F w1

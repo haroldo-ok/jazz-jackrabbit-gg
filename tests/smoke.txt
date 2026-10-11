@@ -1,0 +1,17 @@
+symbols jazz.noi
+run 60
+expectvdp display 1
+screenshot shots/title.ppm
+hold start
+run 3
+hold none
+run 90
+print mode w1
+print game s16
+expect mode == 1 w1
+screenshot shots/play_start.ppm
+hold right
+run 120
+hold none
+print game s16
+screenshot shots/play_right.ppm

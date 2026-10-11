@@ -1,0 +1,14 @@
+symbols jazz.noi
+run 60
+hold start
+run 3
+hold none
+run 60
+hold right
+run 120
+print game s16
+cgstart
+run 240
+cgstop
+cgdump build/cg.out
+print stepsRun w1

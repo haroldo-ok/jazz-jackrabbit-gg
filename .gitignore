@@ -1,0 +1,7 @@
+build/
+gen/
+shots/
+*.noi
+tools/smstest/smstest
+__pycache__/
+tests/bg/

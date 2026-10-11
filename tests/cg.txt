@@ -1,0 +1,12 @@
+symbols jazz.noi
+run 60
+hold start
+run 3
+hold none
+run 60
+hold right
+run 120
+cgstart
+run 120
+cgstop
+cgdump build/cg.out

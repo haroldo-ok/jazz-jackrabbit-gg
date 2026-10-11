@@ -1,0 +1,14 @@
+symbols jazz.noi
+run 60
+hold start
+run 3
+hold none
+run 30
+waituntil SpriteNextFree >= 4 200 w1
+print SpriteTableY w1
+print 0xD2AA w1
+print SpriteTableXN w1
+print 0xD2EA w1
+print 0xD2EB w1
+print 0xD2EC w1
+print SpriteNextFree w1

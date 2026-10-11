@@ -1,0 +1,56 @@
+symbols jazz.noi
+run 60
+hold start
+run 3
+hold none
+run 60
+hold right
+run 160
+run 4
+print spriteUploads w1
+print renderTick w1
+dumpstate build/s1.bin
+run 4
+print spriteUploads w1
+print renderTick w1
+dumpstate build/s2.bin
+run 4
+print spriteUploads w1
+print renderTick w1
+dumpstate build/s3.bin
+run 4
+print spriteUploads w1
+print renderTick w1
+dumpstate build/s4.bin
+run 4
+print spriteUploads w1
+print renderTick w1
+dumpstate build/s5.bin
+run 4
+print spriteUploads w1
+print renderTick w1
+dumpstate build/s6.bin
+run 4
+print spriteUploads w1
+print renderTick w1
+dumpstate build/s7.bin
+run 4
+print spriteUploads w1
+print renderTick w1
+dumpstate build/s8.bin
+run 4
+print spriteUploads w1
+print renderTick w1
+dumpstate build/s9.bin
+run 4
+print spriteUploads w1
+print renderTick w1
+dumpstate build/s10.bin
+run 4
+print spriteUploads w1
+print renderTick w1
+dumpstate build/s11.bin
+run 4
+print spriteUploads w1
+print renderTick w1
+dumpstate build/s12.bin
