@@ -522,6 +522,34 @@ def convert_level(stage, worlds, banks, fixed):
                       bright=bright, dark=dark))
 
 
+# Music: the original MS-DOS songs (Epic's PSM modules) arranged for the PSG
+# by tools/psgmusic.py, one bank per song.  JJ1_DATA points at a directory
+# with the shareware's *.PSM files; without it the ROM is built silent.
+JJ1_DATA = os.environ.get("JJ1_DATA", os.path.expanduser("~/jj1data"))
+SONGS = [("TITLE", "MENUSNG", True), ("DIAMONDUS", "SONG0", True), ("TUBELECTRIC", "SONG3", True),
+         ("MEDIVO", "SONG17", True), ("BOSS", "BOSS", True), ("ENDLEVEL", "ENDLEVEL", False)]
+WORLD_SONG = [1, 2, 3]
+
+
+def convert_music(banks, fixed):
+    import psgmusic
+    out = []
+    for name, fn, loop in SONGS:
+        path = os.path.join(JJ1_DATA, fn + ".PSM")
+        if not os.path.exists(path):
+            print("music: %s missing, song %s silent" % (path, name))
+            out.append(0)
+            continue
+        blob, info = psgmusic.song_blob(path, loop=loop)
+        assert len(blob) <= BANK, (name, len(blob))
+        bk = banks.new()
+        banks.put(bk, 0, blob)
+        out.append(bk)
+        print("music: %-12s %5d bytes, %d orders (%d unique), %d envelopes" % (
+            name, len(blob), info["orders"], info["unique"], info["envs"]))
+    return out
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     banks = Banks()
@@ -530,6 +558,7 @@ def main():
     for s in range(N_STAGES):
         convert_level(s, worlds, banks, fixed)
 
+    songs = convert_music(banks, fixed)
     blob = banks.blob()
     open(os.path.join(OUT, "data.bin"), "wb").write(blob)
 
@@ -568,6 +597,11 @@ def main():
                            "BOSS_SPIKE", "BOSS_SPIKE_LEFT", "BOSS_SHOT",
                            "SPRING0", "SPRING1", "SPRING2", "GEM", "BULLET", "BOSSBAR"]):
         h.append("#define SPECIAL_%s %d" % (n, i))
+    for i, (n, fn, loop) in enumerate(SONGS):
+        h.append("#define SONG_%s %d" % (n, i))
+    h.append("#define SONG_COUNT %d" % len(SONGS))
+    import psgmusic
+    h.append("#define MUSIC_NOTES %d" % len(psgmusic.PERIODS))
     h.append("#define FONT_CHARS \"%s\"" % FONT_CHARS.replace("'", "\\'"))
     h.append("#define FONT_COUNT %d" % len(FONT_CHARS))
     h.append("""
@@ -598,6 +632,9 @@ typedef struct {
 extern const GGStageInfo gg_stage_info[GG_STAGES];
 extern const GGWorldInfo gg_world_info[3];
 extern const unsigned char gg_font[FONT_COUNT * 8];
+extern const unsigned char gg_song_bank[SONG_COUNT];
+extern const unsigned char gg_stage_song[GG_STAGES];
+extern const unsigned int gg_note_period[MUSIC_NOTES];
 #endif""")
     open(os.path.join(OUT, "gg_data.h"), "w").write("\n".join(h) + "\n")
 
@@ -619,6 +656,11 @@ extern const unsigned char gg_font[FONT_COUNT * 8];
     for i in range(0, len(font), 16):
         c.append("    " + ", ".join("0x%02X" % v for v in font[i:i + 16]) + ",")
     c.append("};")
+    c.append("const unsigned char gg_song_bank[SONG_COUNT] = { %s };" % ", ".join(str(b) for b in songs))
+    c.append("const unsigned char gg_stage_song[GG_STAGES] = { %s };" % ", ".join(
+        str(4 if f["boss"] else WORLD_SONG[f["world"]]) for f in fixed))
+    c.append("const unsigned int gg_note_period[MUSIC_NOTES] = { %s };" % ", ".join(
+        str(p) for p in psgmusic.PERIODS))
     open(os.path.join(OUT, "gg_fixed.c"), "w").write("\n".join(c) + "\n")
     print("data banks: %d (%d KB), banks %d..%d" % (len(banks.banks), len(blob) // 1024,
                                                     DATA_BANK0, DATA_BANK0 + len(banks.banks) - 1))

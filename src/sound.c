@@ -1,22 +1,35 @@
-/* Sound effects on the Game Gear PSG.
+/* Sound effects on the Game Gear PSG, stepped from the frame interrupt
+ * right after the music (music.c), whose tone 2 / noise channel they borrow.
  *
  * The Genesis port plays the original JJ1 PCM clips (gun, jump, pickup)
  * through the YM2612's DAC.  The GG has only the SN76489 PSG, so each clip is
  * replaced by a short synthesized envelope with the same role: a rising chirp
  * for the jump, a noise crack for the gun, a two-tone blip for pickups and a
- * falling buzz for damage.  Effects use tone channel 2 and the noise channel,
- * leaving channels 0-1 for music. */
+ * falling buzz for damage.  Effects use tone channel 2 and the noise channel;
+ * while one plays, the music goes on silently on that channel and takes it
+ * back afterwards. */
 
 #include <SMSlib.h>
 #include "sound.h"
+#include "music.h"
 
 __sfr __at 0x7F PSGPort;
 __sfr __at 0x06 GGStereoPort;
 
 enum { SFX_NONE, SFX_JUMP, SFX_FIRE, SFX_PICKUP, SFX_HURT, SFX_LIFE };
 
-static u8 sfx, sfxTime;
+static volatile u8 sfx, sfxTime;
 static u16 sfxTone;
+static const u8 sfxChannels[6] = { 0, 4, 8, 4, 12, 4 };   /* bit 2 tone 2, bit 3 noise */
+
+/* Take the channels the effect needs; give back the ones it no longer uses. */
+static void sfx_claim(u8 mask)
+{
+    u8 drop = musicSfxMask & (u8)~mask;
+    if (drop & 4) { PSGPort = 0xDF; music_release(2); }
+    if (drop & 8) { PSGPort = 0xFF; music_release(3); }
+    musicSfxMask = mask;
+}
 
 static void tone2(u16 n, u8 vol)
 {
@@ -31,19 +44,22 @@ static void noise(u8 mode, u8 vol)
     PSGPort = (u8)(0xF0 | (vol & 0x0F));
 }
 
+/* Stop the sound effect (the music is controlled with music_play). */
 void sound_silence(void)
 {
-    PSGPort = 0x9F;
-    PSGPort = 0xBF;
-    PSGPort = 0xDF;
-    PSGPort = 0xFF;
+    __asm__("di");
     sfx = SFX_NONE;
+    sfx_claim(0);
+    __asm__("ei");
 }
 
 void sound_init(void)
 {
     GGStereoPort = 0xFF;
-    sound_silence();
+    PSGPort = 0x9F;
+    PSGPort = 0xBF;
+    PSGPort = 0xDF;
+    PSGPort = 0xFF;
 }
 
 void sound_events(u8 events)
@@ -57,6 +73,7 @@ void sound_events(u8 events)
     if (want == SFX_NONE) return;
     /* don't let a gunshot cut off damage or a pickup */
     if ((sfx == SFX_HURT || sfx == SFX_LIFE) && sfxTime > 4 && want != SFX_HURT) return;
+    __asm__("di");
     sfx = want;
     sfxTime = 0;
     switch (want) {
@@ -66,8 +83,11 @@ void sound_events(u8 events)
     case SFX_LIFE: sfxTone = 200; break;
     default: break;
     }
+    sfx_claim(sfxChannels[want]);
+    __asm__("ei");
 }
 
+/* One video frame of the current effect; called from the frame interrupt. */
 void sound_update(void)
 {
     u8 t;
@@ -80,7 +100,7 @@ void sound_update(void)
         sfxTone -= 20;
         return;
     case SFX_FIRE:
-        if (t >= 6) { PSGPort = 0xFF; break; }
+        if (t >= 6) break;
         noise(t < 2 ? 4 : 5, (u8)(1 + t * 2));
         return;
     case SFX_PICKUP:
@@ -88,7 +108,7 @@ void sound_update(void)
         tone2(t < 4 ? 120 : 90, (u8)(2 + (t >> 1)));
         return;
     case SFX_HURT:
-        if (t >= 14) { PSGPort = 0xFF; break; }
+        if (t >= 14) break;
         tone2(sfxTone, (u8)(1 + (t >> 1)));
         noise(6, (u8)(6 + (t >> 1)));
         sfxTone += 24;
@@ -98,6 +118,6 @@ void sound_update(void)
         tone2((t & 4) ? 160 : 107, (u8)(2 + (t >> 2)));
         return;
     }
-    PSGPort = 0xDF;
     sfx = SFX_NONE;
+    sfx_claim(0);
 }

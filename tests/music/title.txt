@@ -1,0 +1,3 @@
+psglog build/psg_title.log
+run 3000
+psgstop

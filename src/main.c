@@ -9,6 +9,7 @@
 #include "gg_data.h"
 #include "render.h"
 #include "sound.h"
+#include "music.h"
 
 #define LOGIC_BANK 2
 
@@ -88,6 +89,8 @@ static void frame_irq(void)
         VDPCtrl = 23;       /* line counter period for the next frame */
         VDPCtrl = 0x8A;
     }
+    music_frame();
+    sound_update();
 }
 
 static void sky_enable(u8 on)
@@ -170,12 +173,14 @@ static void show_title(void)
     print_at(0xFF, 15, "1 FIRE   2 JUMP");
     print_at(0xFF, 16, "UP+1 WEAPON");
     SMS_displayOn();
+    music_play(SONG_TITLE);
     mode = MODE_TITLE;
 }
 
-static void show_end(const char *title, const char *message)
+static void show_end(const char *title, const char *message, u8 song)
 {
     sound_silence();
+    music_play(song);
     clear_screen();
     print_at(0xFF, 6, title);
     print_at(0xFF, 9, message);
@@ -186,6 +191,7 @@ static void show_end(const char *title, const char *message)
 
 static void stage_art(void)
 {
+    music_play(gg_stage_song[game.stage]);
     sky_enable(0);
     SMS_displayOff();
     render_stage_begin();
@@ -307,10 +313,10 @@ void main(void)
                 logic_step(playInput);
                 stepsRun++;
                 ev |= game.events;
-                sound_update();
                 if (game.stageChanged || game.finished) break;
             }
             sound_events(ev);
+            music_pause(game.paused);
             if (game.stageChanged) {
                 game.stageChanged = 0;
                 stage_art();
@@ -325,8 +331,8 @@ void main(void)
             }
 #endif
             if (game.finished) {
-                if (game.lives) show_end("EPISODE COMPLETE", "CARROTUS IS SAFE");
-                else show_end("GAME OVER", "TRY AGAIN, JAZZ!");
+                if (game.lives) show_end("EPISODE COMPLETE", "CARROTUS IS SAFE", SONG_ENDLEVEL);
+                else show_end("GAME OVER", "TRY AGAIN, JAZZ!", 0xFF);
             }
         } else {
             if ((keys & ~prevKeys) & GG_KEY_START) show_title();

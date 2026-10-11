@@ -1,6 +1,7 @@
 build/
 gen/
 shots/
+*.gg
 *.noi
 tools/smstest/smstest
 __pycache__/

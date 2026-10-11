@@ -11,12 +11,12 @@ CFLAGS  := -mz80 -DTARGET_GG -I$(DEVKIT)/include -Isrc -Igen --peep-file $(DEVKI
 BANKFLAGS := --codeseg BANK2 --constseg BANK2
 LDFLAGS := -mz80 --no-std-crt0 --data-loc 0xC000 -Wl-b_BANK2=0x28000 -Wl-u
 
-FIXED   := build/main.rel build/render.rel build/gg_world.rel build/sound.rel build/gg_fixed.rel
+FIXED   := build/main.rel build/render.rel build/gg_world.rel build/sound.rel build/music.rel build/gg_fixed.rel
 BANKED  := build/gg_logic.rel
 
 all: $(PROG).gg
 
-gen/gg_data.h gen/gg_fixed.c gen/data.bin: tools/convert.py tools/jjdata.py
+gen/gg_data.h gen/gg_fixed.c gen/data.bin: tools/convert.py tools/jjdata.py tools/psgmusic.py tools/psm.py
 	python3 tools/convert.py
 
 build/%.rel: src/%.c src/*.h gen/gg_data.h | build
