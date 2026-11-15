@@ -29,7 +29,7 @@ typedef signed int s16;
 typedef signed long s32;
 #endif
 
-#define JAZZ_STAGE_COUNT 7
+#define JAZZ_STAGE_COUNT 7     /* most episodes; Holiday Hare has 3 (gg_stageCount) */
 
 #define JAZZ_MAX_ENEMIES 6
 #define JJ1_BOSS_SLOT_SPAN 3
@@ -98,7 +98,8 @@ enum {
     JAZZ_EVENT_EXIT  = 16,
     JAZZ_EVENT_KILL  = 32,
     JAZZ_EVENT_HEALTH = 64,
-    JAZZ_EVENT_LIFE   = 128
+    JAZZ_EVENT_LIFE   = 128,
+    JAZZ_EVENT_SPRING = 256
 };
 
 /* Behaviour classes (jj1_events.h in the Genesis port). */
@@ -111,8 +112,13 @@ enum {
 enum {
     JJ1_ITEM_SCORE = 0, JJ1_ITEM_HEALTH, JJ1_ITEM_LIFE, JJ1_ITEM_FASTFEET,
     JJ1_ITEM_AMMO, JJ1_ITEM_INVINCIBLE, JJ1_ITEM_SHIELD, JJ1_ITEM_HIGHJUMP,
-    JJ1_ITEM_BIRD, JJ1_ITEM_AIRBOARD
+    JJ1_ITEM_BIRD, JJ1_ITEM_AIRBOARD, JJ1_ITEM_DIAMOND
 };
+
+/* Enemy param bits: an episode guardian (modifier 8) whose defeat ends the
+ * level, and an enemy that never moves (movement 0). */
+#define JJ1_PARAM_GUARDIAN 0x80
+#define JJ1_PARAM_STATIONARY 0x40
 
 typedef struct {
     u8 klass;
@@ -200,17 +206,26 @@ typedef struct {
     u8 paused;
     u8 transitionTimer;
     u8 finished;
-    u8 events;
+    u8 eventsLo;      /* (unused: kept so the layout above is unchanged) */
     u8 animState;     /* JJ1_PLAYER_*, derived from physics each step */
     u8 stageChanged;  /* set when build_stage() ran: renderer reloads art */
+    u16 events;       /* JAZZ_EVENT_* of the last step */
+    u8 sfxEvent;      /* original SOUNDS index of the event sound this step, 0 = none */
+    u8 bonusGem;      /* the bonus diamond was collected in this level */
+    u8 bonusPending;  /* set for one step when a level ends holding the diamond */
+    u8 episode;       /* index into gg_episode_info */
 } JazzGame;
 
 extern JazzGame game;
+
+/* The episode being played: its first global stage and its stage count. */
+extern u8 gg_stageBase, gg_stageCount;
 
 /* ---- banked game logic (gg_logic.c, mapped through the slot-2 window) ---- */
 void jazz_game_init(void);
 void jazz_step(u16 input);
 void jazz_set_stage(u8 stage);
+void jazz_resume(void);
 
 /* ---- fixed-ROM world accessors (gg_world.c) ---- */
 extern Jj1EventInfo gg_einfo[128];
@@ -230,5 +245,6 @@ void gg_scan_column(void);   /* scanIds[0..scanN) = events down column scanGx fr
 #define gg_event_info(id) (&gg_einfo[(id)])
 
 u8 jazz_event_taken(u8 gridX, u8 gridY);
+u8 gg_event_sound(u8 id);   /* SOUNDS index an event plays when destroyed */
 
 #endif

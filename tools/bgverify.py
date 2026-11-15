@@ -7,7 +7,24 @@ leaks/underflows (stale slots) after long play.  Usage: bgverify.py dump..."""
 import os, re, struct, subprocess, sys
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
-import preview as P
+G_DIR = os.path.join(ROOT, "gen")
+blob = open(os.path.join(G_DIR, "data.bin"), "rb").read()
+DATA_BANK0 = int(re.search(r"DATA_BANK0 (\d+)", open(os.path.join(G_DIR, "gg_data.h")).read()).group(1))
+WORLD_BANK0 = int(re.search(r"WORLD_BANK0 (\d+)", open(os.path.join(G_DIR, "gg_data.h")).read()).group(1))
+fixed = open(os.path.join(G_DIR, "gg_fixed.c")).read()
+def rows(name):
+    m = re.search(name + r"\[[^\]]*\] = \{(.*?)\n\};", fixed, re.S)
+    return [[int(x, 0) for x in re.match(r"\s*\{ ([^{]*?), \{", l).group(1).split(",")]
+            for l in m.group(1).split("\n") if l.strip().startswith("{")]
+stages, worlds = rows("gg_stage_info"), rows("gg_world_info")
+def bank(n):
+    o = (n - DATA_BANK0) * 0x4000
+    return blob[o:o + 0x4000]
+def pool_tile(lin):
+    d = bank(WORLD_BANK0 + (lin >> 9)); o = (lin & 511) * 32
+    return [[sum(((d[o + y * 4 + k] >> (7 - x)) & 1) << k for k in range(4)) for x in range(8)] for y in range(8)]
+def gamefield(name, deflt=None):
+    return off[name] if name in off else deflt
 off = {k: int(v) for k, v in (l.split() for l in open(os.path.join(ROOT, "gen/offsets.txt")))}
 syms = {}
 for l in open(os.path.join(ROOT, "jazz.noi")):
@@ -37,14 +54,19 @@ def bgshot(path):
 def expected(d):
     ram = d[0x4000 + 48:]
     G = syms["_game"] - 0xC000
-    stage = ram[G + off["stage"]]
+    stage = ram[G + off["stage"]] + ram[syms["_gg_stageBase"] - 0xC000]
     camX = struct.unpack_from("<h", ram, syms["_camX"] - 0xC000)[0]
     camY = struct.unpack_from("<h", ram, syms["_camY"] - 0xC000)[0]
     n = ram[G + off["destroyedCount"]]
     dead = {(ram[G + off["destroyedX"] + i], ram[G + off["destroyedY"] + i]) for i in range(n)}
-    a, _ = P.stages[stage]
-    cellBank, miscBank, world = a[0], a[2], a[4]
-    cm, misc = P.bank(cellBank), P.bank(miscBank)
+    a = stages[stage]
+    miscBank, cellBank, cellAddr, world = a[0], a[1], a[2], a[5]
+    cb, misc = bank(cellBank), bank(miscBank)
+    base = worlds[world][0]
+    def cell(bx, by):
+        p = cellAddr - 0x8000 + (((by >> 2) << 6) + (bx >> 2)) * 2
+        c = (cb[p] | cb[p + 1] << 8) - 0x8000
+        return cb[c + (by & 3) * 4 + (bx & 3)]
     cache = {}
     img = []
     hx0, hy0 = camX >> 1, camY >> 1
@@ -53,13 +75,13 @@ def expected(d):
             hx, hy = hx0 + sx, hy0 + sy
             bx, by = hx >> 4, hy >> 4
             if 0 <= bx < 256 and 0 <= by < 64 and (bx, by) not in dead:
-                blk = misc[cm[(by << 8) + bx]]
+                blk = misc[cell(bx, by)]
             else:
                 blk = 0
             q = ((hy >> 3) & 1) * 2 + ((hx >> 3) & 1)
             ref = misc[0x1300 + (blk * 4 + q) * 2] | (misc[0x1300 + (blk * 4 + q) * 2 + 1] << 8)
             tid = ref & 0x1FFF
-            if tid not in cache: cache[tid] = P.world_tile(world, tid)
+            if tid not in cache: cache[tid] = pool_tile(base + tid)
             t = cache[tid]
             px, py = hx & 7, hy & 7
             if ref & 0x2000: px = 7 - px

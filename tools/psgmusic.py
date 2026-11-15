@@ -2,101 +2,241 @@
 """Arrange the original JJ1 (MS-DOS) PSM tracker songs for the Game Gear PSG.
 
 Pipeline:
-  1. psm.play() runs the 4-channel module tick by tick (pitch, volume, sample
-     position of every channel).
-  2. Ticks are laid on the GG's 60 Hz frame grid.  The frame clock restarts at
+  1. psm.play() runs the module (4 or 8 channels) tick by tick: sample,
+     playback rate, volume and sample position of every channel.
+  2. Every sample the song uses is measured (instruments()): its pitch from
+     the harmonics of its steady part (smpanalysis.py, two-way mismatch), the
+     pitch class confirmed against the song itself (pitchcheck.py: the
+     sample's notes mixed from the original data must have the same chroma
+     as the arranged pitches), chords (major, minor, power, sus) detected the
+     same way, its own pitch movement tracked (bends, tom drops, sweeps), and
+     drums told from pitched sounds.  Names only say which drum a drum is.
+     Roles follow: bass, lead, accompaniment, toms/effects.
+  3. Ticks are laid on the GG's 60 Hz frame grid.  The frame clock restarts at
      every order-list entry, so a pattern that repeats renders to the same
      bytes and is stored once.
-  3. Every note becomes a "voice": a role from the instrument table below
-     (tone / chord arpeggio / drum on the noise channel), a pitch, and a
-     volume envelope measured from the sample itself (RMS per video frame at
-     the note's playback rate), so decays, swells and reversed hi-hats keep
-     their shape.  Volume column / slides shift the envelope's base level.
-  4. Each frame the voices compete for the 3 tone channels and the noise
-     channel by priority (lead > bass > chords > toms), sticking to the
-     channel they already hold; the lowest-priority voice is kept on tone 2,
-     which the sound effects borrow.
-  5. The result is a small event stream (note on with envelope id, base
-     level change, pitch slide, note off, wait n frames) that src/music.c
-     plays from the vertical blank interrupt.
+  4. Every note becomes a voice with a pitch per frame (slides, vibrato and
+     the sample's own movement included; played exactly when it is off the
+     semitone grid) and a loudness envelope: the sample's RMS per video frame
+     at that playback rate, A-weighted and divided by the A-weighted level of
+     the PSG sound playing it, so a kick sample and a square wave of the same
+     perceived loudness get the same volume.  Chords add voices for their
+     other notes, which only take channels nobody else needs.  A bass is
+     moved up by whole octaves into the PSG's range (lowest note A2), single
+     notes below that folded up.
+  5. Each frame the voices compete for the 3 tone channels (role first, then
+     loudness, sticking to the channel they hold) and the noise channel
+     (newest hit); the lowest-priority voice ends up on tone 2, which the
+     sound effects borrow.
+  6. The result is a small event stream (note on with envelope id, level
+     change, new note, exact period, note off, wait n frames) that
+     src/music.c plays from the frame interrupt.
 
-play_reference() is the bit-exact Python model of the Z80 player: it yields
-the PSG register writes per frame, used for the WAV previews and to check the
-ROM's PSG output in the emulator harness."""
+RefPlayer is the bit-exact Python model of the Z80 player: it yields the PSG
+register writes per frame, used for the WAV previews and to check the ROM's
+PSG output in the emulator harness."""
 import math, os, struct, sys
 import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import psm
+import psm, smpanalysis
 
 PSG_CLOCK = 3579545
 FPS = 60
 NOTE_BASE = 45          # note index 0 = A2 (110 Hz), the lowest the PSG reaches
 NUM_NOTES = 64
 
-ARP = {None: 0, "major": 1, "minor": 2, "power": 3}
 ARP_OFS = {0: (0, 0, 0), 1: (0, 4, 7), 2: (0, 3, 7), 3: (0, 7, 12)}
 
 # noise control values (low 3 bits of the 0xE0 latch)
 N_KICK, N_SNARE, N_HAT = 0x02, 0x05, 0x04   # periodic /2048, white /1024, white /512
 
-# Instrument roles by sample name (all pitched JJ1 samples are rooted on C;
-# `root` is that C as a MIDI note, measured with an autocorrelation pitch
-# detector).  prio: lead 4, bass 3, chords 2, toms/effects 1.
-#   ("tone", root, prio, arp, octave_shift)  /  ("noise", ctrl, gain)
-ROLES = {
-    # Diamondus (SONG0)
-    "shaka3":   ("tone", 60, 4, None, 0),
-    "monsterb": ("tone", 36, 3, None, 12),
-    "majorwec": ("tone", 36, 2, "major", 12),
-    "minorwec": ("tone", 48, 2, "minor", 0),
-    "simmstom": ("tone", 48, 1, None, 12),
-    "bassdrum": ("noise", N_KICK, 0),
-    "janetsna": ("noise", N_SNARE, 0),
-    "hihatrev": ("noise", N_HAT, 1),
-    # Tubelectric (SONG3)
-    "luvhorn":  ("tone", 72, 4, None, 0),
-    "ieee":     ("tone", 48, 3, None, 12),
-    "basscrus": ("tone", 36, 3, None, 12),
-    "bddrm":    ("noise", N_KICK, 0),
-    "shaker":   ("noise", N_HAT, 2),
-    "snarever": ("noise", N_SNARE, 0),
-    "realcymc": ("noise", N_HAT, 1),
-    "stopoff":  ("noise", N_SNARE, 1),
-    # Medivo (SONG17)
-    "stern2":   ("tone", 24, 2, None, 24),
-    "bassd2":   ("noise", N_KICK, 0),
-    "snarev2":  ("noise", N_SNARE, 0),
-    "opcchh":   ("noise", N_HAT, 1),
-    "clcchh":   ("noise", N_HAT, 1),
-    "ohme":     ("tone", 55, 2, None, 0),
-    "synb3":    ("tone", 24, 3, None, 24),
-    "chormi":   ("tone", 36, 2, "minor", 12),
-    "chorma":   ("tone", 36, 2, "major", 12),
-    "lorchit2": ("tone", 48, 2, "power", 0),
-    "beep":     ("tone", 60, 4, None, 0),
-    # title (MENUSNG)
-    "gmbdwhh":  ("noise", N_KICK, 0),
-    "gmsnare":  ("noise", N_SNARE, 0),
-    "fsyntbas": ("tone", 24, 3, None, 24),
-    "trumpoct": ("tone", 36, 4, None, 12),
-    "dryfctom": ("tone", 36, 1, None, 12),
-    "vsride":   ("noise", N_HAT, 1),
-    # boss (BOSS)
-    "1funkbd":  ("noise", N_KICK, 0),
-    "1funksd":  ("noise", N_SNARE, 0),
-    "revtom2":  ("tone", 48, 1, None, 0),
-    "ridecymb": ("noise", N_HAT, 1),
-    "metalcho": ("tone", 36, 3, "power", 12),
-    "hoowa":    ("noise", N_SNARE, 2),
-    "ringuit":  ("tone", 36, 4, None, 12),
-    # level-complete jingle (ENDLEVEL)
-    "disthit":  ("tone", 84, 4, None, -12),
-    "fltropen": ("tone", 48, 2, None, 12),
-}
-
 
 def sample_key(s):
     return s.name.lower().split(".")[0].strip()
+
+
+# ------------------------------------------------------ instrument analysis
+# Every sample a song uses is measured (tools/smpanalysis.py: pitch by a
+# two-way mismatch fit of its harmonics, noisiness, brightness).  The pitch
+# class is then checked against the song itself (tools/pitchcheck.py): the
+# sample's notes mixed from the original data must have the same chroma as
+# square waves at the measured pitch, otherwise the pitch class that matches
+# best is taken.  Names only decide what kind of drum a drum is.
+KICK_WORDS = ("bass drum", "bassd", "bassdrum", "bd", "kick", "hitbasd", "drum-ben", "gmbd", "funkbd")
+SNARE_WORDS = ("snare", "sd", "rimsh", "clap", "snar", "janetsna", "snarev", "ntrdr", "reverssd", "funksd")
+HAT_WORDS = ("hat", "hh", "cym", "ride", "shaker", "crash", "ophat", "tamb", "splash", "rangle")
+TOM_WORDS = ("tom", "bongo", "conga", "timb")
+CHORD_WORDS = {"major": ("maj", "major", "chorma"), "minor": ("min", "minor", "chormi"),
+               "power": ("powerch", "metalcho", "lorchit", "orch hit", "orchit", "disthit"),
+               "sus2": ("sus 2", "sus2"), "sus4": ("sus4", "sus 4")}
+FX_WORDS = ("sweep", "glass", "lazer", "laser", "fx", "weow", "call", "jackr", "1993", "future crew",
+            "zine", "reverb", "level ", "brkglass", "blockrev", "hoowa", "if_you")
+CHORD_OFS = {None: (0,), "major": (0, 4, 7), "minor": (0, 3, 7), "power": (0, 7),
+             "sus2": (0, 2, 7), "sus4": (0, 5, 7)}
+# the pieces of a name: "1funkbd" -> has "bd", "SnareRev" -> "snare"
+def _has(name, words):
+    return any(w in name for w in words)
+
+
+def a_weight(f):
+    """IEC 61672 A-weighting as a linear gain (1.0 at 1 kHz)."""
+    f = np.maximum(np.asarray(f, float), 1.0)
+    f2 = f * f
+    ra = (12194.0 ** 2 * f2 * f2) / ((f2 + 20.6 ** 2) * np.sqrt((f2 + 107.7 ** 2) * (f2 + 737.9 ** 2)) *
+                                     (f2 + 12194.0 ** 2))
+    return ra / 0.7943
+
+
+def _square_gain(hz):
+    k = np.arange(1, 60, 2)
+    k = k[k * hz < 20000]
+    return math.sqrt(float(np.sum(8.0 / (math.pi ** 2 * k * k) * a_weight(k * hz) ** 2)))
+
+
+def _noise_gain(ctrl):
+    """A-weighted RMS of the PSG noise channel at full volume (unit amplitude)."""
+    rate = 44100
+    w = synth([[0xE0 | ctrl, 0xF0]] + [[]] * 29, rate)
+    sp = np.abs(np.fft.rfft(w)) ** 2
+    fr = np.fft.rfftfreq(len(w), 1.0 / rate)
+    return math.sqrt(float(np.sum(sp * a_weight(fr) ** 2) / len(w) ** 2 * 2))
+
+
+class Inst:
+    def __repr__(self):
+        if self.kind == "noise":
+            return "noise %02X" % self.ctrl
+        return "tone root %.2f prio %s%s%s" % (self.root, self.prio, (" " + self.chord) if self.chord else "",
+                                              " shift %+d" % self.shift if self.shift else "")
+
+
+def _spec(s):
+    d = np.asarray(s.data[:32768], float)
+    d = d - d.mean()
+    pw = np.abs(np.fft.rfft(d, 1 << 16)) ** 2
+    return np.fft.rfftfreq(1 << 16, 1.0 / s.c5), pw
+
+
+def _refine_octave(s, r0, r):
+    """Of r-12, r, r+12 the one whose harmonic series fits the sample best."""
+    if r == r0:
+        return r0
+    fr, sp = smpanalysis._spectrum(s)
+    peaks = smpanalysis._peaks(fr, sp) if fr is not None else []
+    if not peaks:
+        return r
+    cands = [c for c in (r - 12, r, r + 12) if 20 <= c <= 110]
+    return min(cands, key=lambda c: smpanalysis._twm(peaks, 440.0 * 2 ** ((c - 69) / 12.0)))
+
+
+def instruments(mod, ticks, verbose=False):
+    import pitchcheck
+    use = {}
+    for secs, st in ticks:
+        for c in st:
+            if c is not None:
+                u = use.setdefault(c[0], [0, [], 0.0])
+                u[2] += secs * c[2]
+                if c[5]:
+                    u[0] += 1
+                    u[1].append(c[1])
+    insts = {}
+    tones = []
+    for num, (onsets, freqs, weight) in use.items():
+        s = mod.samples.get(num)
+        if s is None or len(s.data) <= 16:
+            continue
+        name = s.name.lower()
+        info = smpanalysis.analyse(s)
+        it = Inst()
+        it.num, it.name, it.chord, it.shift = num, s.name, None, 0
+        it.fr, it.pw = _spec(s)
+        drum = None
+        if _has(name, KICK_WORDS) and not _has(name, ("bass guit", "bass loop", "superhyper", "lead", "bassg")):
+            drum = N_KICK
+        elif _has(name, HAT_WORDS):
+            drum = N_HAT
+        elif _has(name, SNARE_WORDS) and "bass" not in name:
+            drum = N_SNARE
+        tom = _has(name, TOM_WORDS)
+        root, best, sim, low = info.root, 0, 0.0, False
+        if drum is None and root is not None:
+            named = None
+            for ck, words in CHORD_WORDS.items():
+                if _has(name, words):
+                    named = ck
+            sims = pitchcheck.check(mod, ticks, num, root, 400)
+            if sims:
+                # a chord when its chroma fits clearly better than one note
+                best_c, best_v = None, max(sims)
+                notes = sorted(root + 12 * math.log2(f / s.c5) for f in freqs) or [root]
+                low = notes[len(notes) // 2] < 50 or "bass" in name
+                for ck, ofs in CHORD_OFS.items():
+                    if ck is None or tom or (low and ck != named):
+                        continue
+                    if named and ck != named:
+                        continue
+                    cs = pitchcheck.check(mod, ticks, num, root, 400, ofs)
+                    margin = 0.0 if ck == named else 0.10
+                    if cs and max(cs) > best_v + margin:
+                        best_c, best_v, sims = ck, max(cs) - margin, cs
+                it.chord = best_c
+                best = int(np.argmax(sims))
+                if sims[best] < sims[0] + 0.03:
+                    best = 0
+                sim = sims[best]
+                if best > 6:
+                    best -= 12
+        if drum is None and root is not None and (tom or sim >= 0.70 or (low and sim >= 0.5)):
+            it.kind = "tone"
+            it.root = _refine_octave(s, root, root + best)
+            it.tom = tom
+            it.contour = smpanalysis.contour(s, info.root)
+            it.onsets = onsets
+            it.notes = [it.root + 12 * math.log2(f / s.c5) for f in freqs]
+            it.weight = weight
+            tones.append(it)
+        else:
+            it.kind = "noise"
+            if drum is None:
+                drum = N_HAT if info.bright > 2500 else N_SNARE if info.bright > 350 else N_KICK
+            it.ctrl = drum
+        it.info, it.sim = info, sim
+        insts[num] = it
+    # ---- roles: bass, lead, accompaniment
+    for it in tones:
+        lo = sorted(it.notes)
+        med = lo[len(lo) // 2] if lo else it.root
+        it.median = med
+        name = it.name.lower()
+        if it.tom or _has(name, FX_WORDS):
+            it.prio = 1
+        elif it.chord:
+            it.prio = 2
+        elif med < 52 or "bass" in name:
+            it.prio = 3
+        else:
+            it.prio = None
+    melodic = [it for it in tones if it.prio is None]
+    melodic.sort(key=lambda it: -it.weight)
+    for i, it in enumerate(melodic):
+        it.prio = 4 if i == 0 or it.weight * 2 >= melodic[0].weight else 2
+    # ---- register: move a whole instrument by octaves into the PSG's range
+    lo_note, hi_note = NOTE_BASE, NOTE_BASE + NUM_NOTES - 1
+    for it in tones:
+        notes = sorted(it.notes) or [it.root]
+        k = 0
+        # as few octaves as possible: a few low notes are folded up singly
+        # rather than moving a bass line into the melody's register
+        while notes[int(len(notes) * 0.5)] + k < lo_note - 0.5 and k < 48:
+            k += 12
+        while notes[int(len(notes) * 0.9)] + k > hi_note and k > -48:
+            k -= 12
+        it.shift = k
+    if verbose:
+        for num, it in sorted(insts.items()):
+            print("  %-24s %-40s %s sim %.2f" % (it.name[:24], it, it.info, it.sim))
+    return insts
 
 
 def psg_period(midi):
@@ -107,23 +247,23 @@ PERIODS = [psg_period(NOTE_BASE + i) for i in range(NUM_NOTES + 12)]
 
 
 class Envelopes:
-    """Per (sample, playback rate) attenuation envelopes, frame by frame."""
+    """Per (sample, playback rate, PSG sound) loudness envelopes, frame by frame.
 
-    def __init__(self, mod):
-        self.mod = mod
-        self.cache = {}
-        self.ids = {}
-        self.tables = []
+    Loudness is matched perceptually: the sample's RMS per video frame times
+    its A-weighting gain at that playback rate, divided by the A-weighted gain
+    of the PSG sound that plays it (a square wave at that pitch, or the noise
+    mode).  The loudest moment of the song becomes attenuation 0."""
+
+    def __init__(self, mod, insts):
+        self.mod, self.insts = mod, insts
+        self.db = {}            # key -> (dB per frame, hold)
         self.sq = {}
-        ref = 1.0
         for s in mod.samples.values():
-            if len(s.data) > 64:
+            if len(s.data) > 16:
                 d = np.array(s.data, float)
                 self.sq[s.num] = np.concatenate([[0.0], np.cumsum(d * d)])
-                w = max(32, int(s.c5 / FPS))
-                k = np.convolve(d * d, np.ones(w) / w, "valid")
-                ref = max(ref, math.sqrt(k.max()))
-        self.ref = ref * 0.9
+        self.ids, self.tables, self.att = {}, [], {}
+        self.ref = None
 
     def rms(self, s, a, b):
         """RMS of sample positions [a, b) with looping."""
@@ -149,35 +289,52 @@ class Envelopes:
             return 0.0
         return math.sqrt(tot / cnt)
 
-    def att_curve(self, s, freq, gain):
-        """Attenuation (0..15) per frame for a note at `freq` samples/s."""
+    def a_gain(self, it, freq):
+        s = self.mod.samples[it.num]
+        w = a_weight(it.fr * (freq / s.c5)) ** 2
+        tot = it.pw.sum() or 1.0
+        return math.sqrt(float((it.pw * w).sum() / tot))
+
+    def key(self, smp, freq, psg_gain):
+        k = (smp, int(round(freq)), round(psg_gain, 3))
+        if k in self.db:
+            return k
+        s = self.mod.samples[smp]
+        it = self.insts[smp]
+        g = self.a_gain(it, freq) / psg_gain
         step = freq / FPS
-        out = []
+        out, hold = [], False
         pos = 0.0
-        for k in range(1200):
-            r = self.rms(s, pos, pos + step) if s.num in self.sq else 0.0
-            a = r / self.ref
-            att = 15 if a <= 0 else int(round(-20 * math.log10(a) / 2)) + gain
-            att = max(0, min(15, att))
-            out.append(att)
+        for n in range(1200):
+            r = self.rms(s, pos, pos + step) * g if smp in self.sq else 0.0
+            out.append(20 * math.log10(r) if r > 0 else -200.0)
             pos += step
             if not s.loop and pos >= len(s.data):
                 break
-            if s.loop and k > 4 and pos > s.loop_end + (s.loop_end - s.loop_start):
-                return out, True          # sustained: hold the last level
-        return out, False
+            if s.loop and n > 4 and pos > s.loop_end + (s.loop_end - s.loop_start):
+                hold = True
+                break
+        self.db[k] = (out, hold)
+        return k
 
-    def get(self, smp, freq, gain):
-        key = (smp, int(round(freq)), gain)
-        if key not in self.cache:
-            s = self.mod.samples[smp]
-            curve, hold = self.att_curve(s, freq, gain)
+    def peak(self, k):
+        return max(self.db[k][0])
+
+    def finish(self, ref):
+        """Quantise every envelope against the song's reference level."""
+        self.ref = ref
+
+    def get(self, k):
+        """(envelope id, attenuation per frame, hold) for an envelope key."""
+        if k not in self.att:
+            db, hold = self.db[k]
+            curve = [max(0, min(15, int(round((self.ref - x) / 2.0)))) for x in db]
             enc = encode_env(curve, hold)
             if enc not in self.ids:
                 self.ids[enc] = len(self.tables)
                 self.tables.append(enc)
-            self.cache[key] = (self.ids[enc], curve, hold)
-        return self.cache[key]
+            self.att[k] = (self.ids[enc], curve, hold)
+        return self.att[k]
 
 
 def encode_env(curve, hold):
@@ -220,15 +377,29 @@ class Voice:
     """One note of one tracker channel, as the PSG should play it."""
 
 
-def build(path, loops=1):
+SQUARE_GAINS = {}
+NOISE_GAINS = {}
+
+
+def square_gain(midi):
+    n = int(round(midi))
+    if n not in SQUARE_GAINS:
+        SQUARE_GAINS[n] = _square_gain(440.0 * 2 ** ((n - 69) / 12.0))
+    return SQUARE_GAINS[n]
+
+
+def noise_gain(ctrl):
+    if ctrl not in NOISE_GAINS:
+        NOISE_GAINS[ctrl] = _noise_gain(ctrl)
+    return NOISE_GAINS[ctrl]
+
+
+def build(path, loops=1, verbose=False):
     mod = psm.Module(path)
     ticks, rowmarks = psm.play(mod, loops=loops)
-    envs = Envelopes(mod)
+    mod.insts = instruments(mod, ticks, verbose)
+    envs = Envelopes(mod, mod.insts)
     # ---- frame grid: restart the frame clock at each order entry
-    order_of_tick = [0] * len(ticks)
-    starts = {}
-    for t, oi, ri in rowmarks:
-        starts.setdefault((t, oi), True)
     seg_bounds = []          # (first tick, order index)
     for t, oi, ri in rowmarks:
         if not seg_bounds or seg_bounds[-1][1] != oi:
@@ -251,6 +422,13 @@ def build(path, loops=1):
     # ---- per channel, per frame state
     nch = mod.channels
     voices = []
+
+    def close(v, k):
+        v.end = k
+        voices.append(v)
+        for g in v.ghosts:
+            g.end = k
+            voices.append(g)
     for ch in range(nch):
         cur = None
         per_frame = [None] * total
@@ -268,12 +446,12 @@ def build(path, loops=1):
             s = per_frame[k]
             if s is None:
                 if cur:
-                    cur.end = k; voices.append(cur); cur = None
+                    close(cur, k); cur = None
                 continue
             smp, freq, vol, pos, note, _ = s
             if trig[k] or cur is None or cur.onset != smp:
                 if cur:
-                    cur.end = k; voices.append(cur)
+                    close(cur, k)
                 cur = new_voice(mod, envs, ch, k, smp, freq, note)
                 if cur is None:
                     continue
@@ -281,80 +459,113 @@ def build(path, loops=1):
                 continue
             cur.base.append(vol_att(vol))
             cur.period.append(freq)
+            cur.pos.append(pos)
         if cur:
-            cur.end = total; voices.append(cur)
-    voices = [v for v in voices if v is not None]
+            close(cur, total)
+    # ---- the song's reference level: its loudest voice plays at attenuation 0
+    ref = max(envs.peak(v.ekey) - 2.0 * min(v.base) for v in voices if v.base)
+    envs.finish(ref)
+    for v in voices:
+        v.env, v.curve, v.hold = envs.get(v.ekey)
     return mod, envs, voices, segments, total
 
 
 def new_voice(mod, envs, ch, start, smp, freq, note):
     s = mod.samples.get(smp)
-    if s is None:
-        return None
-    role = ROLES.get(sample_key(s))
-    if role is None or note is None:
+    it = mod.insts.get(smp)
+    if s is None or it is None or note is None:
         return None
     v = Voice()
-    v.ch, v.start, v.onset = ch, start, smp
-    v.base, v.period = [], []
-    if role[0] == "tone":
-        _, root, prio, arp, shift = role
-        v.kind, v.prio, v.arp, v.noise = "tone", prio, ARP[arp], 0
-        gain = 0
+    v.ch, v.start, v.onset, v.it = ch, start, smp, it
+    v.base, v.period, v.pos, v.ghosts = [], [], [], []
+    v.arp = 0
+    if it.kind == "tone":
+        v.kind, v.prio, v.noise, v.ofs = "tone", it.prio, 0, 0
+        pitch = it.root + 12 * math.log2(freq / s.c5) + it.shift
+        v.ekey = envs.key(smp, freq, square_gain(pitch))
+        for o in CHORD_OFS[it.chord][1:]:
+            g = Voice()
+            g.__dict__.update(v.__dict__)
+            g.ghosts, g.ofs, g.prio = [], o, 1.5
+            v.ghosts.append(g)
     else:
-        _, ctrl, gain = role
-        v.kind, v.prio, v.arp, v.noise = "noise", 0, 0, ctrl
-        root, shift = 60, 0
-    v.env, v.curve, v.hold = envs.get(smp, freq, gain)
-    v.root, v.shift = root, shift
+        v.kind, v.prio, v.noise, v.ofs = "noise", 0, it.ctrl, 0
+        v.ekey = envs.key(smp, freq, noise_gain(it.ctrl))
     return v
 
 
-def tone_note(v, freq_hz, smp_c5):
-    """Note index (0 = A2) for a tracker playback frequency."""
-    midi = v.root + 12 * math.log2(freq_hz / smp_c5) + v.shift
-    n = int(round(midi)) - NOTE_BASE
-    while n < 0:
-        n += 12
-    while n + (12 if v.arp == 3 else 7 if v.arp else 0) >= NUM_NOTES + 12:
-        n -= 12
-    return n
-
-
 # ------------------------------------------------------------- arrangement
-EV_WAIT, EV_NOTE, EV_NOTEOFS, EV_OFF, EV_BASE, EV_SETNOTE = range(6)
+EV_WAIT, EV_NOTE, EV_NOTEOFS, EV_OFF, EV_BASE, EV_SETNOTE, EV_SETPER, EV_PERDELTA = range(8)
+CENTS = 0.06   # exact-pitch changes smaller than this (semitones) are not sent
+FINE = 0.12      # semitones a pitch may be off its note before it is played exactly
+
+
+def song_detune(mod, voices):
+    """The song's overall tuning offset (in semitones, -0.5..0.5)."""
+    x = y = 0.0
+    for v in voices:
+        if v.kind == "tone" and v.period and not v.ofs:
+            s = mod.samples[v.onset]
+            p = v.it.root + 12 * math.log2(v.period[0] / s.c5)
+            a = 2 * math.pi * p
+            x += math.cos(a); y += math.sin(a)
+    return math.atan2(y, x) / (2 * math.pi) if (x or y) else 0.0
+
+
+def tone_target(v, freq_hz, smp_c5, detune, pos=0.0):
+    """('n', note index) when the pitch is on a semitone, else ('p', period)."""
+    midi = v.it.root + 12 * math.log2(freq_hz / smp_c5) + v.it.shift + v.ofs - detune
+    if v.it.contour is not None:
+        midi += float(np.interp(pos, v.it.contour[0], v.it.contour[1]))
+    n = int(round(midi)) - NOTE_BASE
+    k = 0
+    while n + k < 0:
+        k += 12
+    while n + k >= NUM_NOTES:
+        k -= 12
+    n += k
+    if abs(midi - round(midi)) <= FINE:
+        return ("n", n)
+    return ("p", psg_period(midi + k))
 
 
 def arrange(mod, voices, total):
     """Per frame, give voices to PSG channels; return events per frame."""
+    detune = song_detune(mod, voices)
     starts = {}
     for v in voices:
         starts.setdefault(v.start, []).append(v)
         c5 = mod.samples[v.onset].c5
         if v.kind == "tone":
-            v.notes = [tone_note(v, f, c5) for f in v.period]
-            v.n0 = v.notes[0]
-        v.sounding = [ (v.curve[k] if k < len(v.curve) else (v.curve[-1] if v.hold and v.curve else 15))
-                       for k in range(v.end - v.start) ]
+            v.targets = [tone_target(v, f, c5, detune, p) for f, p in zip(v.period, v.pos)]
+            t0 = v.targets[0]
+            v.n0 = t0[1] if t0[0] == "n" else int(round(v.it.root + 12 * math.log2(v.period[0] / c5) +
+                                                       v.it.shift + v.ofs - detune)) - NOTE_BASE
+            v.n0 = max(0, min(NUM_NOTES - 1, v.n0))
+        v.sounding = [(v.curve[k] if k < len(v.curve) else (v.curve[-1] if v.hold and v.curve else 15))
+                      for k in range(v.end - v.start)]
     active = []
     holder = [None, None, None, None]      # voice on tone0..2, noise
-    shown = {}                              # voice -> (base, note) last sent
+    shown = {}                              # (channel, voice) -> (base, target) last sent
     events = [[] for _ in range(total)]
     for f in range(total):
         active += starts.get(f, [])
         active = [v for v in active if v.end > f]
 
-        def audible(v):
+        def level(v):
             k = f - v.start
-            return v.sounding[k] + v.base[k] < 15
-        tones = [v for v in active if v.kind == "tone" and audible(v)]
-        noises = [v for v in active if v.kind == "noise" and audible(v)]
+            return v.sounding[k] + v.base[k]
+        tones = [v for v in active if v.kind == "tone" and level(v) < 15]
+        noises = [v for v in active if v.kind == "noise" and level(v) < 15]
         # ---- noise: newest hit wins, then loudest
         want_noise = None
         if noises:
-            want_noise = max(noises, key=lambda v: (v.start, -v.base[f - v.start]))
-        # ---- tones: top 3 by priority, then loudness, then age
-        tones.sort(key=lambda v: (-v.prio, v.sounding[f - v.start] + v.base[f - v.start], v.start))
+            want_noise = max(noises, key=lambda v: (v.start, -level(v)))
+        # ---- tones: the role counts 10 dB, loudness the rest; a voice that
+        # already holds a channel keeps it unless clearly beaten
+        def score(v):
+            return v.prio * 5 - level(v) + (1.5 if v in holder[:3] else 0)
+        tones.sort(key=lambda v: (-score(v), v.start))
         chosen = tones[:3]
         new_hold = [None, None, None]
         for i in range(3):
@@ -365,7 +576,6 @@ def arrange(mod, voices, total):
         for v in sorted(rest, key=lambda v: -v.prio):
             free = [i for i in range(3) if new_hold[i] is None]
             new_hold[free[0]] = v
-        # keep the lowest-priority voice on tone 2 when tone 2 changes hands anyway
         ev = events[f]
         for i in range(4):
             v = want_noise if i == 3 else new_hold[i]
@@ -377,18 +587,28 @@ def arrange(mod, voices, total):
                 continue
             k = f - v.start
             base = min(15, v.base[k])
+            tgt = v.targets[k] if v.kind == "tone" else ("n", v.noise)
             if v is not old:
-                note = v.noise if v.kind == "noise" else v.notes[k]
-                ev.append((EV_NOTEOFS if k else EV_NOTE, i, note, v.env, base | (v.arp << 4), k))
-                shown[(i, id(v))] = (base, note)
+                note = v.noise if v.kind == "noise" else (tgt[1] if tgt[0] == "n" else v.n0)
+                ev.append((EV_NOTEOFS if k else EV_NOTE, i, note, v.env, base, k))
+                if tgt[0] == "p":
+                    ev.append((EV_SETPER, i, tgt[1]))
+                shown[(i, id(v))] = (base, tgt)
                 holder[i] = v
                 continue
-            pb, pn = shown[(i, id(v))]
+            pb, pt = shown[(i, id(v))]
             if base != pb:
                 ev.append((EV_BASE, i, base))
-            if v.kind == "tone" and v.notes[k] != pn:
-                ev.append((EV_SETNOTE, i, v.notes[k]))
-            shown[(i, id(v))] = (base, v.notes[k] if v.kind == "tone" else pn)
+            if tgt != pt:
+                if tgt[0] == "n":
+                    ev.append((EV_SETNOTE, i, tgt[1]))
+                elif pt[0] == "p" and abs(12 * math.log2(pt[1] / tgt[1])) < CENTS:
+                    tgt = pt                      # too small to hear: keep the old period
+                elif pt[0] == "p" and -128 <= tgt[1] - pt[1] < 128:
+                    ev.append((EV_PERDELTA, i, tgt[1] - pt[1]))
+                else:
+                    ev.append((EV_SETPER, i, tgt[1]))
+            shown[(i, id(v))] = (base, tgt)
     # silence held notes at the loop point
     for i in range(4):
         if holder[i] is not None:
@@ -419,6 +639,10 @@ def encode(events, segments, total):
                     out += bytes([0x4C | e[1], e[2]])
                 elif e[0] == EV_SETNOTE:
                     out += bytes([0x50 | e[1], e[2]])
+                elif e[0] == EV_SETPER:
+                    out += bytes([0x54 | e[1], e[2] & 0xFF, e[2] >> 8])
+                elif e[0] == EV_PERDELTA:
+                    out += bytes([0x58 | e[1], e[2] & 0xFF])
             wait += 1
         while wait > 63:
             out.append(63); wait -= 63
@@ -429,75 +653,116 @@ def encode(events, segments, total):
     return segs
 
 
-def song_blob(path, base_addr=0x8000, loop=True):
-    """Bank image: header, order table, envelope table, envelopes, segments."""
-    mod, envs, voices, segments, total = build(path)
-    events = arrange(mod, voices, total)
-    segs = encode(events, segments, total)
-    uniq, order = [], []
-    for s in segs:
-        if s not in uniq:
-            uniq.append(s)
-        order.append(uniq.index(s))
-    restart = 0
-    # segment index of the module's restart order
-    for i, (f0, n, oi) in enumerate(segments):
-        if oi == mod.restart:
-            restart = i
-            break
-    nenv = len(envs.tables)
-    hdr = 4
-    otab = hdr
-    etab = otab + 2 * len(order)
-    edata = etab + 2 * nenv
-    env_addr, pos = [], edata
-    for t in envs.tables:
-        env_addr.append(pos); pos += len(t)
-    seg_addr = []
-    for s in uniq:
-        seg_addr.append(pos); pos += len(s)
-    blob = bytearray()
-    blob += bytes([len(order), restart if loop else 0xFF]) + struct.pack("<H", base_addr + etab)
+_PARTS = {}
+
+
+def song_parts(path, loop=True):
+    """The arranged song: unique segments, order (segment indices), restart
+    order, envelope tables and statistics.  Cached per (path, loop)."""
+    key = (os.path.abspath(path), loop)
+    if key not in _PARTS:
+        mod, envs, voices, segments, total = build(path)
+        events = arrange(mod, voices, total)
+        segs = encode(events, segments, total)
+        uniq, order = [], []
+        for sg in segs:
+            if sg not in uniq:
+                uniq.append(sg)
+            order.append(uniq.index(sg))
+        restart = 0
+        for i, (f0, n, oi) in enumerate(segments):
+            if oi == mod.restart:
+                restart = i
+                break
+        info = dict(frames=total, orders=len(order), unique=len(uniq), envs=len(envs.tables),
+                    size=sum(map(len, uniq)) + 4 + 3 * len(order) + sum(2 + len(t) for t in envs.tables),
+                    voices=len(voices))
+        _PARTS[key] = dict(segs=uniq, order=order, restart=restart if loop else 0xFF,
+                           envs=envs.tables, info=info)
+    return _PARTS[key]
+
+
+def home_blob(parts, seg_locs, base_addr):
+    """The song's home block (it holds the envelopes, so the player keeps its
+    bank mapped while it steps the channels):
+      [orders][restart, 0xFF = play once][envelope table ptr]
+      [order -> segment address, segment bank]... [envelope ptrs]... envelopes.
+    seg_locs[i] = (bank, address) of unique segment i."""
+    order, envs = parts["order"], parts["envs"]
+    etab = 4 + 3 * len(order)
+    pos = etab + 2 * len(envs)
+    env_addr = []
+    for t in envs:
+        env_addr.append(base_addr + pos); pos += len(t)
+    blob = bytearray([len(order), parts["restart"]]) + struct.pack("<H", base_addr + etab)
     for o in order:
-        blob += struct.pack("<H", base_addr + seg_addr[o])
+        bank, addr = seg_locs[o]
+        blob += struct.pack("<HB", addr, bank)
     for a in env_addr:
-        blob += struct.pack("<H", base_addr + a)
-    for t in envs.tables:
+        blob += struct.pack("<H", a)
+    for t in envs:
         blob += t
-    for s in uniq:
-        blob += s
     assert len(blob) == pos
-    info = dict(frames=total, orders=len(order), unique=len(uniq), envs=nenv, size=len(blob),
-                voices=len(voices))
-    return bytes(blob), info
+    return bytes(blob)
+
+
+def song_image(path, loop=True):
+    """A stand-alone ROM image of one song for the tools and tests: home
+    block at bank 1, 0x8000, segments first-fit from bank 2.
+    Returns (image, home bank, home address, info)."""
+    parts = song_parts(path, loop)
+    banks = [bytearray(), bytearray()]
+    locs = []
+    for sg in parts["segs"]:
+        for i in range(2, len(banks)):
+            if len(banks[i]) + len(sg) <= 0x4000:
+                break
+        else:
+            banks.append(bytearray()); i = len(banks) - 1
+        locs.append((i, 0x8000 + len(banks[i])))
+        banks[i] += sg
+    banks[1] = bytearray(home_blob(parts, locs, 0x8000))
+    img = b"".join(bytes(b) + bytes(0x4000 - len(b)) for b in banks)
+    return img, 1, 0x8000, parts["info"]
 
 
 # ------------------------------------------------- reference player (model)
 class RefPlayer:
-    """Bit-exact model of src/music.c.  frame() returns the PSG bytes written."""
+    """Bit-exact model of src/music.c.  frame() returns the PSG bytes written.
+    rom is a ROM image (16 KB banks); the song's home block is at bank:addr
+    (slot-2 addresses)."""
 
-    def __init__(self, blob, base_addr=0x8000):
-        self.b, self.base = blob, base_addr
-        self.norders, self.restart = blob[0], blob[1]
-        self.etab = struct.unpack_from("<H", blob, 2)[0] - base_addr
+    def __init__(self, rom, bank, addr):
+        self.rom, self.home = rom, bank
+        self.hdr = addr
+        self.norders, self.restart = self.rd(bank, addr), self.rd(bank, addr + 1)
+        self.etab = self.rd16(bank, addr + 2)
         self.order = 0
         self.stopped = False
-        self.ptr = self.seg(0)
+        self.seg(0)
         self.wait = 0
         self.ch = [dict(on=False, note=0, arp=0, phase=0, base=0, env=0, run=0, att=15, hold=False,
-                        last_att=15, last_per=0xFFFF) for _ in range(4)]
+                        last_att=15, last_per=0xFFFF, fix=False, per=0) for _ in range(4)]
+
+    def rd(self, bank, addr):
+        return self.rom[bank * 0x4000 + addr - 0x8000]
+
+    def rd16(self, bank, addr):
+        return self.rd(bank, addr) | self.rd(bank, addr + 1) << 8
 
     def seg(self, i):
-        return struct.unpack_from("<H", self.b, 4 + 2 * i)[0] - self.base
+        e = self.hdr + 4 + 3 * i
+        self.ptr = self.rd16(self.home, e)
+        self.sbank = self.rd(self.home, e + 2)
 
     def env_ptr(self, i):
-        return struct.unpack_from("<H", self.b, self.etab + 2 * i)[0] - self.base
+        return self.rd16(self.home, self.etab + 2 * i)
 
     def step_env(self, c):
         if c["hold"]:
             return
         if c["run"] == 0:
-            e = self.b[c["env"]]
+            e = self.rd(self.home, c["env"])
             if e == 0x00:
                 c["on"] = False
                 return
@@ -515,14 +780,14 @@ class RefPlayer:
         self.ch[i]["last_per"] = 0xFFFF
 
     def frame(self, sfx_mask=0):
-        b = self.b
         if self.stopped:
             return []
         if self.wait:
             self.wait -= 1
         else:
+            sb = lambda k: self.rd(self.sbank, self.ptr + k)
             while True:
-                op = b[self.ptr]
+                op = sb(0)
                 self.ptr += 1
                 if op == 0:
                     self.order += 1
@@ -537,7 +802,7 @@ class RefPlayer:
                                     c["last_att"] = 15
                             return out
                         self.order = self.restart
-                    self.ptr = self.seg(self.order)
+                    self.seg(self.order)
                     continue
                 if op < 0x40:
                     self.wait = op - 1
@@ -546,14 +811,15 @@ class RefPlayer:
                 c = self.ch[i]
                 kind = op & 0xFC
                 if kind in (0x40, 0x44):
-                    c["note"] = b[self.ptr]
-                    c["env"] = self.env_ptr(b[self.ptr + 1])
-                    c["base"] = b[self.ptr + 2] & 15
-                    c["arp"] = b[self.ptr + 2] >> 4
+                    c["note"] = sb(0)
+                    c["env"] = self.env_ptr(sb(1))
+                    c["base"] = sb(2) & 15
+                    c["arp"] = sb(2) >> 4
                     self.ptr += 3
                     c["on"], c["run"], c["hold"], c["phase"], c["att"] = True, 0, False, 0, 15
+                    c["fix"] = False
                     if kind == 0x44:
-                        ofs = b[self.ptr]
+                        ofs = sb(0)
                         self.ptr += 1
                         while ofs and c["on"] and not c["hold"]:
                             self.step_env(c)
@@ -563,10 +829,19 @@ class RefPlayer:
                 elif kind == 0x48:
                     c["on"] = False
                 elif kind == 0x4C:
-                    c["base"] = b[self.ptr] & 15
+                    c["base"] = sb(0) & 15
                     self.ptr += 1
                 elif kind == 0x50:
-                    c["note"] = b[self.ptr]
+                    c["note"] = sb(0)
+                    c["fix"] = False
+                    self.ptr += 1
+                elif kind == 0x54:
+                    c["per"] = sb(0) | sb(1) << 8
+                    c["fix"] = True
+                    self.ptr += 2
+                elif kind == 0x58:
+                    d = sb(0)
+                    c["per"] = (c["per"] + (d - 256 if d >= 128 else d)) & 0xFFFF
                     self.ptr += 1
         out = []
         for i, c in enumerate(self.ch):
@@ -576,7 +851,7 @@ class RefPlayer:
             if i < 3:
                 n = c["note"] + ARP_OFS[c["arp"]][c["phase"]]
                 c["phase"] = c["phase"] + 1 if c["phase"] < 2 else 0
-                per = PERIODS[n]
+                per = c["per"] if c["fix"] else PERIODS[n]
             else:
                 per = c["note"]
             if sfx_mask & (1 << i):
@@ -661,12 +936,11 @@ def write_wav(buf, path, rate=44100):
     wf.close()
 
 
-def reference_writes(blob, frames):
-    p = RefPlayer(blob)
+def reference_writes(rom, bank, addr, frames):
+    p = RefPlayer(rom, bank, addr)
     return [p.frame() for _ in range(frames)]
 
 
 if __name__ == "__main__":
     for p in sys.argv[1:]:
-        blob, info = song_blob(p)
-        print(os.path.basename(p), info)
+        print(os.path.basename(p), song_parts(p)["info"])

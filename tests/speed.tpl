@@ -1,9 +1,17 @@
 symbols jazz.noi
+run 90
+hold start
+run 3
+hold none
+run 30
+hold start
+run 3
+hold none
 run 60
 hold start
 run 3
 hold none
-waituntil mode == 1 100 w1
+waituntil mode == 1 900 w1
 run 30
 print @frame
 print renderTick w1

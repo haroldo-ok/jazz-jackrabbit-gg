@@ -194,6 +194,7 @@ static void build_stage(u8 stage)
     g->paused = 0;
     g->transitionTimer = 0;
     g->stageGems = 0;
+    g->bonusGem = 0;
     g->player.subX = 0;
     g->player.subY = 0;
     g->player.vx = 0;
@@ -228,6 +229,19 @@ void jazz_game_init(void)
 void jazz_set_stage(u8 stage)
 {
     build_stage(stage);
+}
+
+/* After a saved game was copied into `game`: reload the level's tables and
+ * the logic's own per-level state, keeping everything the save holds. */
+void jazz_resume(void)
+{
+    u8 bp, bx, by;
+    u16 items;
+    gg_world_load(g->stage);
+    gg_stage_facts(g->stage, &startGridX, &startGridY, &items, &bp, &bx, &by);
+    pcAtX = 0x7FFF;
+    scanSpan = 0;
+    g->stageChanged = 0;
 }
 
 /* ----------------------------------------------------------------- player */
@@ -612,6 +626,7 @@ static void fire_bullet(void)
 static void destroy_cell(u8 gridX, u8 gridY)
 {
     u8 n = g->destroyedCount;
+    g->sfxEvent = gg_event_sound(gg_event(gridX, gridY));
     if (n >= JAZZ_MAX_DESTROYED) return;
     g->destroyedX[n] = gridX;
     g->destroyedY[n] = gridY;
@@ -624,7 +639,18 @@ static void kill_enemy(JazzEnemy *e)
     e->active = 0;
     g->score += 100;
     g->events |= JAZZ_EVENT_KILL;
-    mark_event_taken(e->gridX, e->gridY);
+    {
+        u8 id = gg_event(e->gridX, e->gridY);
+        g->sfxEvent = gg_event_sound(id);
+        mark_event_taken(e->gridX, e->gridY);
+        /* Defeating the guardian (modifier 8) ends the level, the same way
+           the exit sign does; so does Devan's machine. */
+        if ((e->klass != JJ1_CLASS_BOSS) && (e->klass != JJ1_CLASS_DESTRUCT) &&
+            (gg_event_info(id)->param & JJ1_PARAM_GUARDIAN) && !g->transitionTimer) {
+            g->transitionTimer = 75;
+            g->events |= JAZZ_EVENT_EXIT;
+        }
+    }
     if ((e->klass == JJ1_CLASS_BOSS) && !g->transitionTimer) {
         g->transitionTimer = 75;
         g->events |= JAZZ_EVENT_EXIT;
@@ -861,7 +887,10 @@ void spawn_grid_enemy(u8 gx, u8 gy, u8 klass, u8 strength)
     e->direction = -1;
     e->hitPoints = strength ? strength : 1;
     e->phase = (u8)((gx * 7) & 63);
-    e->bossFacing = 0;
+    /* bossFacing is the guardian's own; other enemies use it to remember
+       that they never move. */
+    e->bossFacing = (u8)(((klass != JJ1_CLASS_BOSS) &&
+        (gg_event_info(gg_event(gx, gy))->param & JJ1_PARAM_STATIONARY)) ? 2 : 0);
     if (klass == JJ1_CLASS_ENEMY_WALK) {
         s16 fx = e->x + (ENEMY_W >> 1);
         while ((e->y < (WORLD_H - ENEMY_H - 1)) && !down_pt_solid(fx, e->y + ENEMY_H)) e->y++;
@@ -1073,7 +1102,11 @@ static void grant_item(const Jj1EventInfo *info, u8 gridX, u8 gridY)
     g->stageGems++;
     g->score += (u16)info->points * 25;
     g->events |= JAZZ_EVENT_GEM;
+    g->sfxEvent = gg_event_sound(gg_event(gridX, gridY));
     switch (kind) {
+    case JJ1_ITEM_DIAMOND:
+        g->bonusGem = 1;
+        break;
     case JJ1_ITEM_HEALTH:
         if (g->health < 5) g->health++;
         g->events |= JAZZ_EVENT_HEALTH;
@@ -1213,7 +1246,9 @@ void update_boss(void)
 static void step_enemy(void)
 {
     {
-        if (e->klass == JJ1_CLASS_ENEMY_WALK) {
+        if (e->bossFacing == 2) {
+            /* stationary: it only stands and takes hits */
+        } else if (e->klass == JJ1_CLASS_ENEMY_WALK) {
             s16 nx = e->x + e->direction;
             s16 footX = nx + ((e->direction > 0) ? (ENEMY_W - 1) : 0);
             if (pt_solid(footX, e->y + (ENEMY_H >> 1)) ||
@@ -1272,6 +1307,14 @@ static void update_enemies(void) __naked
     ld  a, 9 (ix)
     or  a, a
     jp  z, 09790$
+    ; stationary enemies (bossFacing 2, not the guardian) only stand
+    ld  a, 15 (ix)
+    cp  a, #2
+    jr  nz, 09702$
+    ld  a, 10 (ix)
+    cp  a, #12
+    jp  nz, 09770$
+09702$:
     ld  a, 10 (ix)
     cp  a, #2
     jr  z, 09710$
@@ -1542,6 +1585,8 @@ void jazz_step(u16 input)
     u16 pressed = input & ~g->previousInput;
     s8 dx, dy;
     g->events = JAZZ_EVENT_NONE;
+    g->sfxEvent = 0;
+    g->bonusPending = 0;
     g->frame++;
 
     if (pressed & JAZZ_INPUT_START) { g->previousInput = input; g->paused = !g->paused; return; }
@@ -1551,8 +1596,10 @@ void jazz_step(u16 input)
         g->previousInput = input;
         g->transitionTimer--;
         if (!g->transitionTimer) {
-            if ((u8)(g->stage + 1) < JAZZ_STAGE_COUNT) build_stage(g->stage + 1);
+            u8 pend = g->bonusGem;   /* the diamond opens the bonus level */
+            if ((u8)(g->stage + 1) < gg_stageCount) build_stage(g->stage + 1);
             else g->finished = 1;
+            g->bonusPending = pend;
         }
         return;
     }
@@ -1619,7 +1666,7 @@ void jazz_step(u16 input)
             g->player.springJump = 1;
             g->player.vy = JAZZ_PYS_JUMP;
             g->player.onGround = 0;
-            g->events |= JAZZ_EVENT_JUMP;
+            g->events |= JAZZ_EVENT_JUMP | JAZZ_EVENT_SPRING;
         }
     }
     scan_grid_enemies();

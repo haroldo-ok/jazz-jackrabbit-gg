@@ -12,39 +12,53 @@
 #include "gg_data.h"
 
 Jj1EventInfo gg_einfo[128];
-u8 gg_cellBank, gg_eventBank, gg_miscBank, gg_sprBank, gg_worldNo;
+u8 gg_cellBank, gg_eventBank, gg_miscBank, gg_worldNo;
+u16 gg_cellAddr, gg_sprBase, gg_evAddr;
+u8 gg_evBank;
+u8 gg_stageBase, gg_stageCount = JAZZ_STAGE_COUNT;
 
 /* One-entry cache of the last block looked up: probes cluster heavily in the
  * two or three blocks around the player. */
 static u8 lastBx = 0xFF, lastBy = 0xFF, lastId;
+u8 clkIn, clkCx = 0xFF, clkCy = 0xFF;
+u16 clkPtr;
+u8 eklIn, eklCx = 0xFF, eklCy = 0xFF;
+u16 eklPtr;
 
 static const u8 bitmask[8] = { 1, 2, 4, 8, 16, 32, 64, 128 };
 /* Set while probing the raw mask (destroyed blocks still solid), as the
  * Genesis guardian's drill does through jj1_runtime_down_point_solid. */
 u8 probeRaw;
 
+/* `stage` is the stage of the current episode (gg_stageBase + stage is the
+ * global stage number). */
 void gg_world_load(u8 stage)
 {
-    const GGStageInfo *si = &gg_stage_info[stage];
+    const GGStageInfo *si = &gg_stage_info[gg_stageBase + stage];
     u8 save = SMS_getROMBank();
     u8 *dst = (u8 *)gg_einfo;
     const u8 *src;
     u16 i;
     gg_cellBank = si->cellBank;
-    gg_eventBank = si->eventBank;
+    gg_cellAddr = si->cellAddr;
     gg_miscBank = si->miscBank;
-    gg_sprBank = si->sprBank;
+    gg_eventBank = si->miscBank;
+    gg_evBank = si->evBank;
+    gg_evAddr = si->evAddr;
     gg_worldNo = si->world;
+    gg_sprBase = gg_episode_info[si->episode].sprBase;
     SMS_mapROMBank(gg_miscBank);
     src = MISC_EVENTINFO;
     for (i = 0; i < 512; i++) *dst++ = *src++;
     SMS_mapROMBank(save);
     lastBx = 0xFF;
+    clkCx = 0xFF;
+    eklCx = 0xFF;
 }
 
 void gg_stage_facts(u8 stage, u8 *sx, u8 *sy, u16 *items, u8 *bossPresent, u8 *bx, u8 *by)
 {
-    const GGStageInfo *si = &gg_stage_info[stage];
+    const GGStageInfo *si = &gg_stage_info[gg_stageBase + stage];
     *sx = si->startX;
     *sy = si->startY;
     *items = si->items;
@@ -53,8 +67,156 @@ void gg_stage_facts(u8 stage, u8 *sx, u8 *sy, u16 *items, u8 *bossPresent, u8 *b
     *by = si->bossY;
 }
 
+/* Cell id of block (B = bx, D = by), both inside the map, with the cell bank
+ * mapped.  The map is 4x4-cell chunks: 1024 chunk pointers at gg_cellAddr,
+ * row-major by chunk ((by >> 2) * 64 + (bx >> 2)), each pointing at 16
+ * row-major cell ids (16-byte aligned).  Returns A; preserves BC, DE, HL. */
+/* clkCx/clkCy/clkPtr: the last chunk looked up (reset per stage). */
+static void cell_lookup(void) __naked
+{
+    __asm
+    push hl
+    ld  a, d
+    and a, #3
+    add a, a
+    add a, a
+    ld  l, a
+    ld  a, b
+    and a, #3
+    or  a, l
+    ld  (_clkIn), a
+    ; same chunk as last time?
+    ld  a, b
+    and a, #0xFC
+    ld  l, a
+    ld  a, (_clkCx)
+    cp  a, l
+    jr  nz, 09121$
+    ld  a, d
+    and a, #0x3C
+    ld  l, a
+    ld  a, (_clkCy)
+    cp  a, l
+    jr  nz, 09121$
+    ld  hl, (_clkPtr)
+    jr  09122$
+09121$:
+    ld  a, b
+    and a, #0xFC
+    ld  (_clkCx), a
+    ld  a, d
+    and a, #0x3C
+    ld  (_clkCy), a
+    ld  l, a
+    ld  h, #0
+    add hl, hl
+    add hl, hl
+    add hl, hl
+    add hl, hl
+    add hl, hl
+    ld  a, b
+    and a, #0xFC
+    rrca
+    add a, l
+    ld  l, a
+    adc a, h
+    sub a, l
+    ld  h, a
+    push de
+    ld  de, (_gg_cellAddr)
+    add hl, de
+    pop de
+    ld  a, (hl)
+    inc hl
+    ld  h, (hl)
+    ld  l, a
+    ld  (_clkPtr), hl
+09122$:
+    ld  a, (_clkIn)
+    or  a, l
+    ld  l, a
+    ld  a, (hl)
+    pop hl
+    ret
+    __endasm;
+}
+
 /* u8 gg_event(s16 bx, s16 by): event id of a block, 0 outside the map.
- * Hand-written: it is called for every grid query the logic makes.
+ * The event grid is stored as sparse columns in the stage bank: a table of
+ * 257 column starts (MISC_EVCOL), then (row, id) pairs in row order.
+ * sdcccall(1): HL = bx, DE = by, result in A. */
+/* eklCx/eklCy/eklPtr (event map): the last chunk looked up (reset per stage). */
+static void ev_lookup(void) __naked
+{
+    __asm
+    push hl
+    ld  a, d
+    and a, #3
+    add a, a
+    add a, a
+    ld  l, a
+    ld  a, b
+    and a, #3
+    or  a, l
+    ld  (_eklIn), a
+    ; same chunk as last time?
+    ld  a, b
+    and a, #0xFC
+    ld  l, a
+    ld  a, (_eklCx)
+    cp  a, l
+    jr  nz, 09141$
+    ld  a, d
+    and a, #0x3C
+    ld  l, a
+    ld  a, (_eklCy)
+    cp  a, l
+    jr  nz, 09141$
+    ld  hl, (_eklPtr)
+    jr  09142$
+09141$:
+    ld  a, b
+    and a, #0xFC
+    ld  (_eklCx), a
+    ld  a, d
+    and a, #0x3C
+    ld  (_eklCy), a
+    ld  l, a
+    ld  h, #0
+    add hl, hl
+    add hl, hl
+    add hl, hl
+    add hl, hl
+    add hl, hl
+    ld  a, b
+    and a, #0xFC
+    rrca
+    add a, l
+    ld  l, a
+    adc a, h
+    sub a, l
+    ld  h, a
+    push de
+    ld  de, (_gg_evAddr)
+    add hl, de
+    pop de
+    ld  a, (hl)
+    inc hl
+    ld  h, (hl)
+    ld  l, a
+    ld  (_eklPtr), hl
+09142$:
+    ld  a, (_eklIn)
+    or  a, l
+    ld  l, a
+    ld  a, (hl)
+    pop hl
+    ret
+    __endasm;
+}
+
+/* u8 gg_event(s16 bx, s16 by): event id of a block, 0 outside the map.
+ * The event grid is chunked like the cell map (4x4-cell chunks).
  * sdcccall(1): HL = bx, DE = by, result in A. */
 u8 gg_event(s16 bx, s16 by) __naked
 {
@@ -66,16 +228,17 @@ u8 gg_event(s16 bx, s16 by) __naked
     ld  a, e
     cp  a, #64
     jr  nc, 09109$
-    add a, #0x80
-    ld  h, a
+    ld  d, a
+    ld  b, l
     ld  a, (0xFFFF)
     ld  c, a
-    ld  a, (_gg_eventBank)
+    ld  a, (_gg_evBank)
     ld  (0xFFFF), a
-    ld  b, (hl)
+    call _ev_lookup
+    ld  e, a
     ld  a, c
     ld  (0xFFFF), a
-    ld  a, b
+    ld  a, e
     ret
 09109$:
     xor a, a
@@ -83,20 +246,87 @@ u8 gg_event(s16 bx, s16 by) __naked
     __endasm;
 }
 
-/* Cell id of a 32 px block (bank switching included). */
-u8 gg_cell_id(u8 bx, u8 by)
+/* Sound an event makes when it is taken / killed / broken. */
+u8 gg_event_sound(u8 id)
 {
-    u8 save, id;
-    save = SMS_getROMBank();
-    SMS_mapROMBank(gg_cellBank);
-    {
-        u16 off = by;
-        off <<= 8;
-        off |= bx;
-        id = *((const u8 *)(0x8000 + off));
-    }
+    u8 save = SMS_getROMBank(), r;
+    SMS_mapROMBank(gg_miscBank);
+    r = MISC_EVSOUND[id & 127];
     SMS_mapROMBank(save);
-    return id;
+    return r;
+}
+
+/* Cell id of a 32 px block (bank switching included). */
+u8 gg_cell_id(u8 bx, u8 by) __naked
+{
+    (void)bx; (void)by;
+    __asm
+    ld  b, a
+    ld  d, l
+    ld  a, (0xFFFF)
+    ld  c, a
+    ld  a, (_gg_cellBank)
+    ld  (0xFFFF), a
+    call _cell_lookup
+    ld  e, a
+    ld  a, c
+    ld  (0xFFFF), a
+    ld  a, e
+    ret
+    __endasm;
+}
+
+/* n cell ids starting at in-map block (bx, by), stepping right or down, into
+ * out[] (render streaming).  The cell bank is left mapped. */
+u8 crBx, crBy, crN, crH;
+u8 *crOut;
+static void cell_run_asm(void) __naked
+{
+    __asm
+    ld  a, (_crN)
+    or  a, a
+    ret z
+    ld  e, a
+    ld  a, (_crBx)
+    ld  b, a
+    ld  a, (_crBy)
+    ld  d, a
+    ld  hl, (_crOut)
+    ld  a, (_crH)
+    ld  c, a
+09171$:
+    call _cell_lookup
+    ld  (hl), a
+    inc hl
+    ld  a, c
+    or  a, a
+    jr  z, 09172$
+    inc b
+    jr  09173$
+09172$:
+    inc d
+09173$:
+    dec e
+    jr  nz, 09171$
+    ret
+    __endasm;
+}
+
+void gg_cell_run(u8 bx, u8 by, u8 n, u8 horizontal, u8 *out)
+{
+    SMS_mapROMBank(gg_cellBank);
+    crBx = bx; crBy = by; crN = n; crH = horizontal; crOut = out;
+    cell_run_asm();
+}
+
+u8 gg_cell_id_mapped(u8 bx, u8 by) __naked
+{
+    (void)bx; (void)by;
+    __asm
+    ld  b, a
+    ld  d, l
+    jp  _cell_lookup
+    __endasm;
 }
 
 /* Item collected / enemy killed at this event cell.  Lives in fixed ROM:
@@ -186,14 +416,8 @@ static void probe_common(void) __naked
     ld  (_lastBy), a
     ld  a, (_gg_cellBank)
     ld  (0xFFFF), a
-    push hl
-    ld  a, d
-    add a, #0x80
-    ld  h, a
-    ld  l, b
-    ld  a, (hl)
+    call _cell_lookup
     ld  (_lastId), a
-    pop hl
 09102$:
     ld  a, (_lastId)
     ld  h, a
@@ -398,11 +622,10 @@ static void block_id(void) __naked
     push af
     ld  a, (_gg_cellBank)
     ld  (0xFFFF), a
-    ld  a, c
-    add a, #0x80
-    ld  h, a
-    ld  l, b
-    ld  a, (hl)
+    push de
+    ld  d, c
+    call _cell_lookup
+    pop de
     ld  (_lastId), a
     ld  l, a
     pop af
@@ -684,51 +907,111 @@ u8 gg_ground_dist(s16 x, s16 y)
 }
 
 u8 scanGx, scanGy0, scanN, scanIds[16];
-
-/* scanIds[0..scanN) = event ids down column scanGx from row scanGy0. */
-void gg_scan_column(void) __naked
+u8 evcGx, evcGy, evcN;
+/* the cell-run loop over the event map (crBx.. as in gg_cell_run) */
+static void ev_run_asm(void) __naked
 {
     __asm
+    ld  a, (_crN)
+    or  a, a
+    ret z
+    ld  e, a
+    ld  a, (_crBx)
+    ld  b, a
+    ld  a, (_crBy)
+    ld  d, a
+    ld  hl, (_crOut)
+09181$:
+    call _ev_lookup
+    ld  (hl), a
+    inc hl
+    inc b
+    dec e
+    jr  nz, 09181$
+    ret
+    __endasm;
+}
+u8 *evcOut;
+
+/* evcN ids down column evcGx from row evcGy into evcOut: one chunk lookup
+ * per 4 rows, then the rows of that chunk 4 bytes apart. */
+static void ev_column_asm(void) __naked
+{
+    __asm
+    ld  a, (_evcN)
+    or  a, a
+    ret z
+    ld  e, a
+    ld  a, (_evcGx)
+    ld  b, a
+    ld  a, (_evcGy)
+    ld  d, a
+    ld  hl, (_evcOut)
     ld  a, (0xFFFF)
     push af
-    ld  a, (_gg_eventBank)
+    ld  a, (_gg_evBank)
     ld  (0xFFFF), a
-    ld  a, (_scanGy0)
-    add a, #0x80
-    ld  h, a
-    ld  a, (_scanGx)
+09161$:
+    call _ev_lookup
+    ld  (hl), a
+    inc hl
+    inc d
+    dec e
+    jr  z, 09169$
+    ; more rows in the same chunk (d & 3 != 0): read them 4 bytes apart
+    ld  a, d
+    and a, #3
+    jr  z, 09161$
+    push hl
+    ld  hl, (_eklPtr)
+    ld  a, d
+    and a, #3
+    add a, a
+    add a, a
+    ld  c, a
+    ld  a, b
+    and a, #3
+    or  a, c
+    or  a, l
     ld  l, a
-    ld  de, #_scanIds
-    ld  a, (_scanN)
-    or  a, a
-    jr  z, 09992$
-    ld  b, a
-09991$:
     ld  a, (hl)
-    ld  (de), a
-    inc de
-    inc h
-    djnz 09991$
-09992$:
+    pop hl
+    jr  09161$ + 3
+09169$:
     pop af
     ld  (0xFFFF), a
     ret
     __endasm;
 }
 
+/* n event ids along row gy from column gx0 (all inside the map). */
+void gg_event_row(u8 gx0, u8 gy, u8 n, u8 *out)
+{
+    u8 save = SMS_getROMBank();
+    SMS_mapROMBank(gg_evBank);
+    {
+        extern u8 crBx, crBy, crN, crH;
+        extern u8 *crOut;
+        crBx = gx0; crBy = gy; crN = n; crH = 1; crOut = out;
+        ev_run_asm();
+    }
+    SMS_mapROMBank(save);
+}
+
 /* n event ids down column gx from row gy0 (all inside the map). */
 void gg_event_column(u8 gx, u8 gy0, u8 n, u8 *out)
 {
-    u8 save = SMS_getROMBank();
-    const u8 *p;
-    u16 off = gy0;
-    off <<= 8;
-    off |= gx;
-    p = (const u8 *)(0x8000 + off);
-    SMS_mapROMBank(gg_eventBank);
-    while (n--) {
-        *out++ = *p;
-        p += 256;
-    }
-    SMS_mapROMBank(save);
+    evcGx = gx;
+    evcGy = gy0;
+    evcN = n;
+    evcOut = out;
+    ev_column_asm();
+}
+
+u8 scanGx, scanGy0, scanN, scanIds[16];
+
+/* scanIds[0..scanN) = event ids down column scanGx from row scanGy0. */
+void gg_scan_column(void)
+{
+    gg_event_column(scanGx, scanGy0, scanN, scanIds);
 }

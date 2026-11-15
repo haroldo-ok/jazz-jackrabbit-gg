@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """Compare the ROM's PSG writes (smstest psglog) with tools/psgmusic.py's
-reference player: the byte streams must be identical, and the ROM must stay
-in step with the model's 60 Hz timing (within one frame, since the harness's
-frame counter may tick in the middle of an interrupt).
-Usage: check.py psglog SONG.PSM [once]"""
+reference player running on the same ROM's song data: the byte streams must
+be identical, and the ROM must stay in step with the model's 60 Hz timing
+(within one frame, since the harness's frame counter may tick in the middle
+of an interrupt).
+Usage: check.py psglog SONG.PSM [--sync | --sfx]"""
 import os, sys
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
+import re
 import psgmusic
 log, path = sys.argv[1], sys.argv[2]
-loop = "once" not in sys.argv[3:]
+name = os.path.splitext(os.path.basename(path))[0].upper()
+idx = int(re.search(r"#define SONG_%s (\d+)" % name, open(os.path.join(ROOT, "gen/gg_data.h")).read()).group(1))
+tab = re.search(r"gg_song\[SONG_COUNT\] = \{(.*?)\};", open(os.path.join(ROOT, "gen/gg_fixed.c")).read()).group(1)
+bank, addr = [(int(b), int(a, 16)) for b, a in re.findall(r"\{ (\d+), 0x([0-9A-Fa-f]+) \}", tab)][idx]
+rom = open(os.path.join(ROOT, "jazz.gg"), "rb").read()
 rows = [(int(f), int(v, 16)) for f, v in (l.split() for l in open(log))]
 # skip power-on and music_play silence writes (volume-off latches)
 i = 0
@@ -17,8 +23,7 @@ while "--sync" not in sys.argv and i < len(rows) and (rows[i][1] & 0x9F) == 0x9F
     i += 1
 rows = rows[i:]
 f0 = rows[0][0]
-blob, info = psgmusic.song_blob(path, loop=loop)
-p = psgmusic.RefPlayer(blob)
+p = psgmusic.RefPlayer(rom, bank, addr)
 ref, ref_frame = [], []
 fr = 0
 while len(ref) < len(rows) + 5000 and fr < 200000:
@@ -30,7 +35,7 @@ while len(ref) < len(rows) + 5000 and fr < 200000:
     fr += 1
     if p.stopped:
         break
-rom = [v for f, v in rows]
+rom = [v for f, v in rows]          # from here on: the ROM's PSG writes
 
 
 def split(stream):

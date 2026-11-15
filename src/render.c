@@ -24,8 +24,24 @@
 #include "jazz_game.h"
 #include "gg_data.h"
 #include "render.h"
+/* Profiling builds (-DGG_TIMERS): smstest's debug timers on port 0x06. */
+#ifdef GG_TIMERS
+__sfr __at 0x06 TPort;
+#define TS(i) (TPort = (u8)(((i) << 1) | 1))
+#define TE(i) (TPort = (u8)((i) << 1))
+#else
+#define TS(i)
+#define TE(i)
+#endif
 
-extern u8 gg_cellBank, gg_eventBank, gg_miscBank, gg_sprBank, gg_worldNo;
+__sfr __at 0xBF VDPControlPort;
+__sfr __at 0xBE VDPDataPort;
+
+extern u8 gg_cellBank, gg_eventBank, gg_miscBank, gg_worldNo;
+extern u16 gg_sprBase;
+void gg_cell_run(u8 bx, u8 by, u8 n, u8 horizontal, u8 *out);
+void gg_event_column(u8 gx, u8 gy0, u8 n, u8 *out);
+void gg_event_row(u8 gx0, u8 gy, u8 n, u8 *out);
 
 /* ------------------------------------------------------------ VRAM plan */
 /* Sprite tile indices (VRAM tiles 256 + n). */
@@ -59,6 +75,7 @@ s16 camX, camY;
 static s16 winX = -100, winY = -100;
 static u8 scrollX, scrollY;
 u8 cacheMisses;   /* per frame, for profiling/tests */
+u8 cacheFull;     /* tiles drawn as sky because the cache was full (tests) */
 u8 spriteUploads; /* per frame */
 
 /* ------------------------------------------------------------ tile cache */
@@ -70,12 +87,16 @@ u8 spriteUploads; /* per frame */
  * page-aligned addresses above the C data so the hand-written loops index
  * them with one register load (the Makefile checks the data stays below). */
 u8 tileSlot[TILE_POOL_MAX];
-static u16 slotTile[256];
+/* slotTile[] and the item list are rebuilt whenever a stage is drawn, so
+ * the bonus levels borrow their RAM (renderOverlay, bonus.c). */
+#define MAX_LIST 40
+u8 renderOverlay[512 + MAX_LIST * 10];
+#define slotTile ((u16 *)renderOverlay)
 u8 __at(0xD700) blockRef[256];
 u8 __at(0xD800) blockSlot[1024];
 u8 __at(0xDC00) slotRef[256];
 static u8 nextSlot;
-static u8 curTileBank;
+static u16 curTileBase;   /* the world's first tile in the linear world pool */
 
 static void cache_reset(void)
 {
@@ -119,12 +140,15 @@ static u8 cache_miss(u16 tid)
         if (!nextSlot) nextSlot = 1;
         if (!slotRef[s]) break;
     }
-    if (!n) return 0;   /* cache full: draw sky rather than corrupt */
+    if (!n) { cacheFull++; return 0; }   /* cache full: draw sky rather than corrupt */
     if (slotTile[s] != 0xFFFF) tileSlot[slotTile[s]] = 0;
     slotTile[s] = tid;
     tileSlot[tid] = s;
-    SMS_mapROMBank(curTileBank + (u8)(tid >> 9));
-    vram_tile((const void *)(0x8000 + ((tid & 511) << 5)), (u16)s << 5);
+    {
+        u16 lin = curTileBase + tid;
+        SMS_mapROMBank((u8)(WORLD_BANK0 + (u8)(lin >> 9)));
+        vram_tile((const void *)(0x8000 + ((lin & 511) << 5)), (u16)s << 5);
+    }
     cacheMisses++;
     return s;
 }
@@ -175,7 +199,6 @@ u8 runBlk[RUN_MAX];
 static void run_blocks(s16 bx, s16 by, u8 n, u8 horizontal, u8 original)
 {
     u8 i, x, y, lo = 0, hi = 0;
-    u8 *bp;
     /* Clip the run to the map: cells outside show block 0. */
     for (i = 0; i < n; i++) runBlk[i] = 0;
     if ((by < 0) || (by >= 64) || (bx < -RUN_MAX) || (bx >= 256)) goto done;
@@ -185,35 +208,18 @@ static void run_blocks(s16 bx, s16 by, u8 n, u8 horizontal, u8 original)
         if (bx + cnt > 256) cnt = (u8)(256 - bx);
         x = (u8)bx;
         y = (u8)by;
-        {
-            u16 off = y;
-            const u8 *src;
-            off <<= 8;
-            off |= x;
-            src = (const u8 *)(0x8000 + off);
-            SMS_mapROMBank(gg_cellBank);
-            memcpy(runBlk + skip, src, cnt);
-            lo = skip;
-            hi = (u8)(skip + cnt);
-        }
+        gg_cell_run(x, y, cnt, 1, runBlk + skip);
+        lo = skip;
+        hi = (u8)(skip + cnt);
     } else {
         u8 cnt = n;
         if (bx < 0) goto done;
         if (by + cnt > 64) cnt = (u8)(64 - by);
         x = (u8)bx;
         y = (u8)by;
-        {
-            u16 off = y;
-            const u8 *src;
-            off <<= 8;
-            off |= x;
-            src = (const u8 *)(0x8000 + off);
-            SMS_mapROMBank(gg_cellBank);
-            bp = runBlk;
-            for (i = 0; i < cnt; i++) { *bp++ = *src; src += 256; }
-            lo = 0;
-            hi = cnt;
-        }
+        gg_cell_run(x, y, cnt, 0, runBlk);
+        lo = 0;
+        hi = cnt;
     }
     /* cell ids -> render blocks (destroyed blocks show the sky) */
     SMS_mapROMBank(gg_miscBank);
@@ -404,25 +410,29 @@ static void run_remove_asm(void) __naked
 
 static void run_add(s16 bx, s16 by, u8 n, u8 horizontal)
 {
+    TS(1);
     run_blocks(bx, by, n, horizontal, 0);
+    TE(1); TS(2);
     ra_col = (u8)((bx << 1) & 31);
     ra_row = (u8)((u8)by % 14) << 1;
     ra_n = n;
     ra_horiz = horizontal;
     run_add_asm();
+    TE(2);
 }
 
 static void run_remove(s16 bx, s16 by, u8 n, u8 horizontal, u8 original)
 {
+    TS(3);
     run_blocks(bx, by, n, horizontal, original);
     ra_n = n;
     run_remove_asm();
+    TE(3);
 }
 
 /* ------------------------------------------------- items in the window */
 /* Cells of interest (items, springs, bridges) inside the window, kept up to
  * date incrementally as the window moves. */
-#define MAX_LIST 40
 /* One record per cell of interest; px/py are the cell's position in half
  * (screen) pixels, precomputed so drawing only adds the camera base. */
 typedef struct {
@@ -431,8 +441,8 @@ typedef struct {
     u8 aux;          /* springs: sprite tile of the variant */
     u8 pad;
 } ItemEntry;
-static ItemEntry items[MAX_LIST];
-static u8 listCount;
+#define items ((ItemEntry *)(renderOverlay + 512))
+u8 listCount;
 
 static void list_add(u8 x, u8 y, u8 id)
 {
@@ -454,11 +464,16 @@ static void list_add(u8 x, u8 y, u8 id)
     listCount++;
 }
 
+static void list_scan2(s16 bx, s16 by, u8 n, u8 horizontal);
 static void list_scan(s16 bx, s16 by, u8 n, u8 horizontal)
 {
+    TS(4);
+    list_scan2(bx, by, n, horizontal);
+    TE(4);
+}
+static void list_scan2(s16 bx, s16 by, u8 n, u8 horizontal)
+{
     u8 i, x, y, cnt;
-    u16 off;
-    const u8 *src;
     s16 c = n;
     if (horizontal) {
         if ((by < 0) || (by >= 64)) return;
@@ -473,17 +488,16 @@ static void list_scan(s16 bx, s16 by, u8 n, u8 horizontal)
     cnt = (u8)c;
     x = (u8)bx;
     y = (u8)by;
-    off = y;
-    off <<= 8;
-    off |= x;
-    src = (const u8 *)(0x8000 + off);
-    SMS_mapROMBank(gg_eventBank);
     if (horizontal) {
-        for (i = 0; i < cnt; i++, src++)
-            if (*src) list_add((u8)(x + i), y, *src);
+        u8 ids[RUN_MAX];
+        gg_event_row(x, y, cnt, ids);
+        for (i = 0; i < cnt; i++)
+            if (ids[i]) list_add((u8)(x + i), y, ids[i]);
     } else {
-        for (i = 0; i < cnt; i++, src += 256)
-            if (*src) list_add(x, (u8)(y + i), *src);
+        u8 ids[RUN_MAX];
+        gg_event_column(x, y, cnt, ids);
+        for (i = 0; i < cnt; i++)
+            if (ids[i]) list_add(x, (u8)(y + i), ids[i]);
     }
 }
 
@@ -544,7 +558,9 @@ static void window_move(s16 nx, s16 ny)
         list_scan(winX, winY - 1, WIN_W, 1);
     }
     winY = ny;
+    TS(5);
     list_prune();
+    TE(5);
 }
 
 static u8 renderedDestroyed;
@@ -609,7 +625,7 @@ static void upload_asm(void) __naked
     rr  l
     srl h
     rr  l
-    ld  bc, #0xA000
+    ld  bc, #0xB600
     add hl, bc
     ld  c, (hl)
     ld  hl, #_bitOf
@@ -628,13 +644,13 @@ static void upload_asm(void) __naked
     ld  (hl), #1
     jr  09403$
 09402$:
-    ; --- bank = sprBank + (tile >> 9); src = 0x8000 + (tile & 511) * 32
+    ; --- tile += sprBase; bank = SPR_BANK0 + (tile >> 9); src = 0x8000 + (tile & 511) * 32
     ld  hl, (_upl_tile)
+    ld  de, (_gg_sprBase)
+    add hl, de
     ld  a, h
     srl a
-    ld  b, a
-    ld  a, (_gg_sprBank)
-    add a, b
+    add a, #SPR_BANK0
     ld  (0xFFFF), a
     ld  a, h
     and a, #1
@@ -1558,16 +1574,88 @@ static void hide_sprites(void)
     SMS_copySpritestoSAT();
 }
 
+/* ------------------------------------------------------ palette cycling */
+/* The world's rotating palette ranges (water, lava, lights): each turns its
+ * ring of colours in the original's direction and pace, from the level's
+ * cycle mask (tools/jj1_cycle.py in the Genesis port).  The colours are
+ * worked out with the frame and written to CRAM right after VBlank. */
+static u8 cyCount, cyPhase[4], cyTick[4], cyDirty;
+static const GGCycle *cyDef[4];
+static u16 cyRing[4][4];
+
+static void palette_cycles_begin(const GGStageInfo *si, const GGWorldInfo *wi)
+{
+    u8 i;
+    cyCount = 0;
+    cyDirty = 0;
+    for (i = 0; i < wi->cycleCount; i++) {
+        const GGCycle *c = &wi->cycles[i];
+        if (!(si->cycleMask & c->bit) || !c->count || !c->step) continue;
+        cyDef[cyCount] = c;
+        cyPhase[cyCount] = 0;
+        cyTick[cyCount] = 0;
+        cyCount++;
+    }
+}
+
+static void palette_cycles_step(u8 steps)
+{
+    u8 i, s, k, p;
+    for (i = 0; i < cyCount; i++) {
+        const GGCycle *c = cyDef[i];
+        u8 moved = 0;
+        cyTick[i] += steps;
+        while (cyTick[i] >= c->step) {
+            cyTick[i] -= c->step;
+            k = c->count;
+            if (c->dir > 0) cyPhase[i] = (u8)(cyPhase[i] ? cyPhase[i] - 1 : k - 1);
+            else cyPhase[i] = (u8)((cyPhase[i] + 1 == k) ? 0 : cyPhase[i] + 1);
+            moved = 1;
+        }
+        if (!moved) continue;
+        k = c->count;
+        p = cyPhase[i];
+        for (s = 0; s < k; s++) {
+            cyRing[i][s] = c->colors[p];
+            if (++p == k) p = 0;
+        }
+        cyDirty |= (u8)(1 << i);
+    }
+}
+
+static void palette_cycles_vblank(void)
+{
+    u8 i, s;
+    if (!cyDirty) return;
+    for (i = 0; i < cyCount; i++) {
+        const GGCycle *c;
+        if (!(cyDirty & (1 << i))) continue;
+        c = cyDef[i];
+        for (s = 0; s < c->count; s++) {
+            u16 v = cyRing[i][s];
+            u8 a = (u8)((c->slot + s) << 1);
+            __asm__("di");
+            VDPControlPort = a;
+            VDPControlPort = 0xC0;
+            VDPDataPort = (u8)v;
+            VDPDataPort = (u8)(v >> 8);
+            __asm__("ei");
+        }
+    }
+    cyDirty = 0;
+}
+
 /* Called with the display off whenever the stage (and so the art) changes. */
 void render_stage_begin(void)
 {
-    const GGStageInfo *si = &gg_stage_info[game.stage];
+    const GGStageInfo *si = &gg_stage_info[gg_stageBase + game.stage];
     const GGWorldInfo *wi = &gg_world_info[si->world];
     u8 i;
     hide_sprites();
     GG_loadBGPalette(wi->bgPal);
     GG_loadSpritePalette(si->spritePal);
-    curTileBank = wi->tileBank;
+    curTileBase = wi->tileBase;
+    palette_cycles_begin(si, wi);
     hudBright = si->hudBright;
     hudDark = si->hudDark;
     load_font(256 + SPR_FONT, hudBright, hudDark, 1);
@@ -1658,6 +1746,7 @@ void render_vblank(void)
     SMS_setBGScrollX(scrollX);
     SMS_setBGScrollY(scrollY);
     UNSAFE_SMS_copySpritestoSAT();
+    palette_cycles_vblank();
 }
 
 /* Everything for the next frame (map streaming, sprite list).  `steps` is
@@ -1668,25 +1757,28 @@ void render_frame(u8 steps)
     spriteUploads = 0;
     winMoved = 0;
     renderTick++;
+    TS(14); palette_cycles_step(steps); TE(14);
     while (steps--) {
         camX = camera_follow(camX, wanted_x());
         camY = camera_follow(camY, wanted_y());
     }
+    TS(9);
     apply_destroyed();
     window_move(camX >> 5, camY >> 5);
+    TE(9);
     update_scroll_values();
     baseX = GG_X0 - (camX >> 1);
     baseY = GG_Y0 - (camY >> 1);
 
     uploadBudget = 16;
     SMS_initSprites();
-    draw_hud();
-    draw_player();
+    TS(10); draw_hud(); TE(10);
+    TS(11); draw_player();
     draw_board();
     draw_bullets();
-    draw_companions();
-    draw_enemies();
-    draw_items();
+    draw_companions(); TE(11);
+    TS(12); draw_enemies(); TE(12);
+    TS(13); draw_items(); TE(13);
     SMS_finalizeSprites();
 }
 

@@ -1,28 +1,27 @@
 /* Sound effects on the Game Gear PSG, stepped from the frame interrupt
  * right after the music (music.c), whose tone 2 / noise channel they borrow.
  *
- * The Genesis port plays the original JJ1 PCM clips (gun, jump, pickup)
- * through the YM2612's DAC.  The GG has only the SN76489 PSG, so each clip is
- * replaced by a short synthesized envelope with the same role: a rising chirp
- * for the jump, a noise crack for the gun, a two-tone blip for pickups and a
- * falling buzz for damage.  Effects use tone channel 2 and the noise channel;
- * while one plays, the music goes on silently on that channel and takes it
- * back afterwards. */
+ * The Genesis port plays the original SOUNDS.000 clips and the four weapon
+ * clips through its PCM channels.  Here every clip has been converted
+ * offline (tools/psgsfx.py) into a frame-by-frame PSG part: loudness, pitch
+ * on tone channel 2, and the unpitched frames on the noise channel.  The
+ * events pick clips the way the Genesis update_sfx() does; a clip only
+ * interrupts one of lower or equal priority.  While a clip plays, the music
+ * goes on silently on the borrowed channels and takes them back afterwards. */
 
 #include <SMSlib.h>
+#include "gg_data.h"
 #include "sound.h"
 #include "music.h"
+#include "fe.h"
 
 __sfr __at 0x7F PSGPort;
 __sfr __at 0x06 GGStereoPort;
 
-enum { SFX_NONE, SFX_JUMP, SFX_FIRE, SFX_PICKUP, SFX_HURT, SFX_LIFE };
+static volatile u8 sfxOn, sfxPrio;
+static const u8 *volatile sfxPtr;
+static u8 sfxUsed;      /* channels this clip has used: bit 2 tone 2, bit 3 noise */
 
-static volatile u8 sfx, sfxTime;
-static u16 sfxTone;
-static const u8 sfxChannels[6] = { 0, 4, 8, 4, 12, 4 };   /* bit 2 tone 2, bit 3 noise */
-
-/* Take the channels the effect needs; give back the ones it no longer uses. */
 static void sfx_claim(u8 mask)
 {
     u8 drop = musicSfxMask & (u8)~mask;
@@ -31,24 +30,11 @@ static void sfx_claim(u8 mask)
     musicSfxMask = mask;
 }
 
-static void tone2(u16 n, u8 vol)
-{
-    PSGPort = (u8)(0xC0 | (n & 0x0F));
-    PSGPort = (u8)((n >> 4) & 0x3F);
-    PSGPort = (u8)(0xD0 | (vol & 0x0F));
-}
-
-static void noise(u8 mode, u8 vol)
-{
-    PSGPort = (u8)(0xE0 | (mode & 0x07));
-    PSGPort = (u8)(0xF0 | (vol & 0x0F));
-}
-
-/* Stop the sound effect (the music is controlled with music_play). */
 void sound_silence(void)
 {
     __asm__("di");
-    sfx = SFX_NONE;
+    sfxOn = 0;
+    sfxPrio = 0;
     sfx_claim(0);
     __asm__("ei");
 }
@@ -62,62 +48,78 @@ void sound_init(void)
     PSGPort = 0xFF;
 }
 
-void sound_events(u8 events)
+/* Start clip `id` (SFX_*) at priority `prio` (1..3). */
+void sound_play(u8 id, u8 prio)
 {
-    u8 want = SFX_NONE;
-    if (events & JAZZ_EVENT_HURT) want = SFX_HURT;
-    else if (events & JAZZ_EVENT_LIFE) want = SFX_LIFE;
-    else if (events & JAZZ_EVENT_GEM) want = SFX_PICKUP;
-    else if (events & JAZZ_EVENT_JUMP) want = SFX_JUMP;
-    else if (events & JAZZ_EVENT_FIRE) want = SFX_FIRE;
-    if (want == SFX_NONE) return;
-    /* don't let a gunshot cut off damage or a pickup */
-    if ((sfx == SFX_HURT || sfx == SFX_LIFE) && sfxTime > 4 && want != SFX_HURT) return;
+    u8 save;
+    if (!id || id > SFX_COUNT || !feOptions.sfx) return;
+    if (sfxOn && prio < sfxPrio) return;
     __asm__("di");
-    sfx = want;
-    sfxTime = 0;
-    switch (want) {
-    case SFX_JUMP: sfxTone = 380; break;
-    case SFX_PICKUP: sfxTone = 120; break;
-    case SFX_HURT: sfxTone = 500; break;
-    case SFX_LIFE: sfxTone = 200; break;
-    default: break;
-    }
-    sfx_claim(sfxChannels[want]);
+    save = SMS_getROMBank();
+    SMS_mapROMBank(SFX_BANK);
+    sfxPtr = (const u8 *)SFX_TABLE[id - 1];
+    SMS_mapROMBank(save);
+    sfxPrio = prio;
+    sfxOn = 1;
+    sfxUsed = 0;
     __asm__("ei");
 }
 
-/* One video frame of the current effect; called from the frame interrupt. */
+/* Weapon clips: blaster, toaster, upward (photon), bouncer (rocket); the
+ * fifth shot has none in the original. */
+static const u8 shotSfx[JAZZ_SHOT_TYPES] = {
+    SFX_SHOT_BLASTER, SFX_SHOT_TOASTER, SFX_SHOT_UPWARD, SFX_SHOT_BOUNCER, 0
+};
+static u8 prevShield, prevBird;
+
+/* The Genesis update_sfx(), event for event. */
+void sound_events(u16 events, u8 sfxEvent)
+{
+    if (game.player.shield && !prevShield) sound_play(SFX_INVULN, 2);
+    if (game.player.bird && !prevBird) sound_play(SFX_BIRDY, 2);
+    prevShield = game.player.shield ? 1 : 0;
+    prevBird = game.player.bird ? 1 : 0;
+    if (events & JAZZ_EVENT_HURT) sound_play(SFX_OW, 2);
+    else if (events & JAZZ_EVENT_KILL) sound_play(sfxEvent ? sfxEvent : SFX_BOOM, 2);
+    else if (events & JAZZ_EVENT_FIRE) sound_play(shotSfx[game.player.shotType], 1);
+    if (events & JAZZ_EVENT_EXIT) sound_play(SFX_YEAHOO, 3);
+    else if (events & JAZZ_EVENT_SPRING) sound_play(SFX_SPRING, 1);
+    else if (events & JAZZ_EVENT_JUMP) sound_play(SFX_JUMP, 1);
+    if (events & JAZZ_EVENT_LIFE) sound_play(SFX_ONEUP, 3);
+    else if (sfxEvent && !(events & (JAZZ_EVENT_HURT | JAZZ_EVENT_KILL))) sound_play(sfxEvent, 1);
+    else if (events & (JAZZ_EVENT_GEM | JAZZ_EVENT_HEALTH)) sound_play(SFX_YUM, 1);
+}
+
+/* One video frame of the current clip; called from the frame interrupt. */
 void sound_update(void)
 {
-    u8 t;
-    if (sfx == SFX_NONE) return;
-    t = sfxTime++;
-    switch (sfx) {
-    case SFX_JUMP:
-        if (t >= 12) break;
-        tone2(sfxTone, (u8)(2 + (t >> 1)));
-        sfxTone -= 20;
-        return;
-    case SFX_FIRE:
-        if (t >= 6) break;
-        noise(t < 2 ? 4 : 5, (u8)(1 + t * 2));
-        return;
-    case SFX_PICKUP:
-        if (t >= 10) break;
-        tone2(t < 4 ? 120 : 90, (u8)(2 + (t >> 1)));
-        return;
-    case SFX_HURT:
-        if (t >= 14) break;
-        tone2(sfxTone, (u8)(1 + (t >> 1)));
-        noise(6, (u8)(6 + (t >> 1)));
-        sfxTone += 24;
-        return;
-    case SFX_LIFE:
-        if (t >= 24) break;
-        tone2((t & 4) ? 160 : 107, (u8)(2 + (t >> 2)));
-        return;
+    u8 save, b0, b1, b2;
+    if (!sfxOn) return;
+    save = SMS_getROMBank();
+    SMS_mapROMBank(SFX_BANK);
+    b0 = sfxPtr[0];
+    b1 = sfxPtr[1];
+    b2 = sfxPtr[2];
+    SMS_mapROMBank(save);
+    sfxPtr += 3;
+    if (b0 & 0x10) {
+        /* noise frame: tone 2 rests */
+        sfx_claim(sfxUsed | 8 | 4);
+        sfxUsed |= 12;
+        PSGPort = 0xDF;
+        PSGPort = (u8)(0xE0 | (b1 & 7));
+        PSGPort = (u8)(0xF0 | (b0 & 15));
+    } else {
+        sfx_claim(sfxUsed | 4);
+        sfxUsed |= 4;
+        if (sfxUsed & 8) PSGPort = 0xFF;
+        PSGPort = (u8)(0xC0 | (b1 & 0x0F));
+        PSGPort = (u8)(((b2 << 4) | (b1 >> 4)) & 0x3F);
+        PSGPort = (u8)(0xD0 | (b0 & 15));
     }
-    sfx = SFX_NONE;
-    sfx_claim(0);
+    if (b0 & 0x80) {
+        sfxOn = 0;
+        sfxPrio = 0;
+        sfx_claim(0);
+    }
 }

@@ -2,15 +2,19 @@
  * tools/psgmusic.py (whose RefPlayer class is the exact model of this file).
  *
  * Runs from the frame interrupt, one step per video frame, so the tempo does
- * not depend on how long the game loop takes.  Each song lives in its own
- * ROM bank, paged into slot 2 for the duration of the step and the previous
- * mapping put back.
+ * not depend on how long the game loop takes.  A song's home block (order
+ * table and envelopes) sits in one ROM bank and its pattern segments in any
+ * banks; the step pages the segment's bank into slot 2 while it reads events
+ * and the home bank while it steps the envelopes, then puts the previous
+ * mapping back.
  *
- * Song bank: [orders][restart (0xFF = play once)][envelope table ptr]
- *            [order -> segment ptr]... [envelope ptrs]... envelopes, segments.
+ * Home block: [orders][restart (0xFF = play once)][envelope table ptr]
+ *             [order -> segment ptr, segment bank]... [envelope ptrs]... envelopes.
  * Segment bytes: 0 end, 1..63 wait n frames, 0x40+ch note (note, env, base),
  * 0x44+ch note joined late (+ frames to skip), 0x48+ch off, 0x4C+ch base,
- * 0x50+ch new note keeping the envelope.  Envelope bytes: att << 4 | frames,
+ * 0x50+ch new note keeping the envelope, 0x54+ch exact tone period (2 bytes,
+ * kept until the next note; slides, vibrato and bends), 0x58+ch exact period
+ * plus a signed byte.  Envelope bytes: att << 4 | frames,
  * 0x00 end, 0x10 hold.
  *
  * Tone 2 and the noise channel are shared with the sound effects: while an
@@ -25,17 +29,20 @@ __sfr __at 0x7F MusicPSG;
 
 /* 16 bytes: the assembly below indexes channels with shifts and uses
  * these offsets (on 0, note 1, arp 2, phase 3, base 4, att 5, run 6,
- * hold 7, env 8, lastAtt 10, lastPer 11). */
+ * hold 7, env 8, lastAtt 10, lastPer 11, fix 13, per 14). */
 typedef struct {
     unsigned char on, note, arp, phase, base, att, run, hold;
     const unsigned char *env;
     unsigned char lastAtt;
     unsigned int lastPer;
-    unsigned char pad[3];
+    unsigned char fix;          /* 1: play `per` instead of the note */
+    unsigned int per;
 } MusChan;
 
 MusChan mc[4];
-unsigned char musBank;                 /* 0 = no music */
+unsigned char musBank;                 /* home bank, 0 = no music */
+unsigned char musSegBank;              /* bank of the segment being read */
+const unsigned int *musOrdTab;          /* the song's order table (header + 4) */
 unsigned char musOrders, musRestart, musOrder, musWait, musPause, musSave, musTmpMask;
 const unsigned char *musPtr;
 const unsigned int *musEnvTab;
@@ -44,7 +51,6 @@ unsigned char musicSfxMask;
 const unsigned char arpOfs[12] = { 0, 0, 0,  0, 4, 7,  0, 3, 7,  0, 7, 12 };
 
 #define BANK_REG (*(volatile unsigned char *)0xFFFF)
-#define ORDER_PTR(i) (((const unsigned int *)0x8004)[i])
 
 void silence_all(void)
 {
@@ -69,23 +75,27 @@ void music_play(unsigned char song)
 {
     unsigned char save, i, bank = 0;
     __asm__("di");
-    if (song < SONG_COUNT) bank = gg_song_bank[song];
+    const unsigned char *hdr = 0;
+    if (song < SONG_COUNT) { bank = gg_song[song].bank; hdr = (const unsigned char *)gg_song[song].addr; }
     musBank = 0;
     silence_all();
     for (i = 0; i < 4; i++) {
         mc[i].on = 0;
         mc[i].phase = 0;
+        mc[i].fix = 0;
         mc[i].lastAtt = 15;
         mc[i].lastPer = 0xFFFF;
     }
     if (bank) {
         save = BANK_REG;
         BANK_REG = bank;
-        musOrders = *(const unsigned char *)0x8000;
-        musRestart = *(const unsigned char *)0x8001;
-        musEnvTab = *(const unsigned int *const *)0x8002;
+        musOrders = hdr[0];
+        musRestart = hdr[1];
+        musEnvTab = *(const unsigned int *const *)(hdr + 2);
+        musOrdTab = (const unsigned int *)(hdr + 4);
         musOrder = 0;
-        musPtr = (const unsigned char *)ORDER_PTR(0);
+        musPtr = (const unsigned char *)(hdr[4] | (hdr[5] << 8));
+        musSegBank = hdr[6];
         BANK_REG = save;
         musWait = 0;
         musBank = bank;
@@ -171,6 +181,8 @@ void music_frame(void) __naked
     jp  09730$
     ; ---------------------------------------------------------- events
 09710$:
+    ld  a, (_musSegBank)
+    ld  (0xFFFF), a
     ld  hl, (_musPtr)
 09711$:
     ld  a, (hl)
@@ -188,17 +200,27 @@ void music_frame(void) __naked
     cp  a, #0xFF
     jp  z, 09760$
 09712$:
+    ; order entries are 3 bytes (address, bank) in the home bank
     ld  (_musOrder), a
     ld  l, a
     ld  h, #0
+    ld  e, l
+    ld  d, h
     add hl, hl
-    ld  de, #0x8004
     add hl, de
-    ld  a, (hl)
+    ld  de, (_musOrdTab)
+    add hl, de
+    ld  a, (_musBank)
+    ld  (0xFFFF), a
+    ld  e, (hl)
     inc hl
-    ld  h, (hl)
-    ld  l, a
-    jr  09711$
+    ld  d, (hl)
+    inc hl
+    ld  a, (hl)
+    ld  (_musSegBank), a
+    ld  (0xFFFF), a
+    ex  de, hl
+    jp  09711$
 09713$:
     cp  a, #0x40
     jr  nc, 09714$
@@ -233,11 +255,39 @@ void music_frame(void) __naked
     jr  09711$
 09716$:
     cp  a, #0x50
-    jr  nz, 09717$
+    jr  nz, 09721$
     ld  a, (hl)
     inc hl
     ld  1(ix), a
-    jr  09711$
+    ld  13(ix), #0
+    jp  09711$
+09721$:
+    cp  a, #0x58
+    jr  nz, 09722$
+    ld  a, (hl)
+    inc hl
+    ld  e, a
+    rla
+    sbc a, a
+    ld  d, a
+    ld  a, 14(ix)
+    add a, e
+    ld  14(ix), a
+    ld  a, 15(ix)
+    adc a, d
+    ld  15(ix), a
+    jp  09711$
+09722$:
+    cp  a, #0x54
+    jr  nz, 09717$
+    ld  a, (hl)
+    inc hl
+    ld  14(ix), a
+    ld  a, (hl)
+    inc hl
+    ld  15(ix), a
+    ld  13(ix), #1
+    jp  09711$
 09717$:
     ; note on: note, envelope, base | arp << 4 [, frames to skip]
     ld  a, (hl)
@@ -251,11 +301,15 @@ void music_frame(void) __naked
     add hl, hl
     ld  de, (_musEnvTab)
     add hl, de
+    ld  a, (_musBank)
+    ld  (0xFFFF), a
     ld  a, (hl)
     inc hl
     ld  h, (hl)
     ld  8(ix), a
     ld  9(ix), h
+    ld  a, (_musSegBank)
+    ld  (0xFFFF), a
     pop hl
     ld  a, (hl)
     inc hl
@@ -270,6 +324,7 @@ void music_frame(void) __naked
     and a, #15
     ld  2(ix), a
     ld  0(ix), #1
+    ld  13(ix), #0
     ld  6(ix), #0
     ld  7(ix), #0
     ld  3(ix), #0
@@ -279,6 +334,8 @@ void music_frame(void) __naked
     ld  b, (hl)
     inc hl
     push hl
+    ld  a, (_musBank)
+    ld  (0xFFFF), a
 09718$:
     ld  a, b
     or  a, a
@@ -293,6 +350,8 @@ void music_frame(void) __naked
     dec b
     jr  09718$
 09720$:
+    ld  a, (_musSegBank)
+    ld  (0xFFFF), a
     pop hl
 09719$:
     ld  a, c
@@ -304,6 +363,8 @@ void music_frame(void) __naked
     jp  09711$
     ; ---------------------------------------------------------- channels
 09730$:
+    ld  a, (_musBank)
+    ld  (0xFFFF), a
     ld  a, (_musicSfxMask)
     ld  (_musTmpMask), a
     ld  ix, #_mc
@@ -343,7 +404,14 @@ void music_frame(void) __naked
     ld  a, b
     cp  a, #3
     jr  z, 09735$
-    ; period = gg_note_period[note + arpOfs[arp * 3 + phase]]
+    ; period = the exact one, or gg_note_period[note + arpOfs[arp * 3 + phase]]
+    ld  a, 13(ix)
+    or  a, a
+    jr  z, 09742$
+    ld  e, 14(ix)
+    ld  d, 15(ix)
+    jr  09736$
+09742$:
     ld  a, 2(ix)
     or  a, a
     ld  a, 1(ix)

@@ -1,6 +1,7 @@
 /* Host implementation of the fixed-ROM accessors (gg_world.c), reading the
  * same converted banks the ROM uses (gen/data.bin), with the asm routines'
- * semantics written out in C. */
+ * semantics written out in C: the chunked cell and event maps (4x4-cell
+ * chunks behind 1024 chunk pointers) and the stage bank's tables. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,8 +9,10 @@
 #include "gg_data.h"
 
 Jj1EventInfo gg_einfo[128];
+u8 gg_stageBase, gg_stageCount = JAZZ_STAGE_COUNT;
 static unsigned char *blob;
-static const unsigned char *cellB, *eventB, *miscB;
+static const unsigned char *miscB;
+static const GGStageInfo *si;
 
 static const unsigned char *bank(int n) { return blob + (size_t)(n - DATA_BANK0) * 0x4000; }
 
@@ -26,25 +29,33 @@ void host_world_init(const char *path)
 
 void gg_world_load(u8 stage)
 {
-    const GGStageInfo *si = &gg_stage_info[stage];
-    cellB = bank(si->cellBank);
-    eventB = bank(si->eventBank);
+    si = &gg_stage_info[gg_stageBase + stage];
     miscB = bank(si->miscBank);
     memcpy(gg_einfo, miscB + 0x1100, 512);
 }
 
 void gg_stage_facts(u8 stage, u8 *sx, u8 *sy, u16 *items, u8 *bossPresent, u8 *bx, u8 *by)
 {
-    const GGStageInfo *si = &gg_stage_info[stage];
-    *sx = si->startX; *sy = si->startY; *items = (u16)si->items;
-    *bossPresent = si->bossPresent; *bx = si->bossX; *by = si->bossY;
+    const GGStageInfo *s = &gg_stage_info[gg_stageBase + stage];
+    *sx = s->startX; *sy = s->startY; *items = (u16)s->items;
+    *bossPresent = s->bossPresent; *bx = s->bossX; *by = s->bossY;
+}
+
+static u8 chunked(u8 bnk, u16 addr, u8 bx, u8 by)
+{
+    const unsigned char *b = bank(bnk);
+    u16 ref = (u16)(addr - 0x8000 + (((by >> 2) * 64 + (bx >> 2)) << 1));
+    u16 ptr = (u16)(b[ref] | (b[ref + 1] << 8));
+    return b[ptr - 0x8000 + ((by & 3) << 2) + (bx & 3)];
 }
 
 u8 gg_event(s16 bx, s16 by)
 {
     if ((u16)bx >= 256 || (u16)by >= 64) return 0;
-    return eventB[((u16)by << 8) | (u16)bx];
+    return chunked(si->evBank, si->evAddr, (u8)bx, (u8)by);
 }
+
+u8 gg_event_sound(u8 id) { return miscB[0x2600 + (id & 127)]; }
 
 u8 jazz_event_taken(u8 gx, u8 gy)
 {
@@ -66,7 +77,7 @@ static u8 probe(s16 x, s16 y, unsigned off)
     u8 bx, by, id, m;
     if (x < 0 || y < 0 || x >= 8192 || y >= 2048) return 1;
     bx = (u8)(x >> 5); by = (u8)(y >> 5);
-    id = cellB[((u16)by << 8) | bx];
+    id = chunked(si->cellBank, si->cellAddr, bx, by);
     m = miscB[off + ((unsigned)id << 3) + ((y >> 2) & 7)];
     if (!(m & (1 << ((x >> 2) & 7)))) return 0;
     if (!probeRaw && game.destroyedCount && gg_cell_destroyed(bx, by)) return 0;
@@ -87,7 +98,7 @@ u8 gg_ground_dist(s16 x, s16 y)
 }
 void gg_event_column(u8 gx, u8 gy0, u8 n, u8 *out)
 {
-    while (n--) { *out++ = eventB[((u16)gy0 << 8) | gx]; gy0++; }
+    while (n--) { *out++ = (u8)gg_event(gx, gy0); gy0++; }
 }
 
 u8 scanGx, scanGy0, scanN, scanIds[16];

@@ -3,12 +3,18 @@
 #include <stdlib.h>
 #include "jazz_game.h"
 #include "diff_common.h"
+#include "gg_data.h"
 JazzGame game;
 void host_world_init(const char *path);
 int main(int argc, char **argv)
 {
     int stage = argc > 2 ? atoi(argv[2]) : 0, frames = argc > 3 ? atoi(argv[3]) : 3000, f, i;
     host_world_init(argv[1]);
+    if (getenv("EP")) {
+        int e = atoi(getenv("EP")) - 1;
+        gg_stageBase = gg_episode_info[e].firstStage;
+        gg_stageCount = gg_episode_info[e].stages;
+    }
     if (argc > 4) diffLfsr = (unsigned short)strtoul(argv[4], 0, 0);
     jazz_game_init();
     if (stage) jazz_set_stage((u8)stage);

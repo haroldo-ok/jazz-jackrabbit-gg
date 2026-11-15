@@ -9,14 +9,16 @@ OPT     := --opt-code-speed --max-allocs-per-node 5000
 CFLAGS  := -mz80 -DTARGET_GG -I$(DEVKIT)/include -Isrc -Igen --peep-file $(DEVKIT)/include/peep-rules.txt $(OPT) $(EXTRA)
 # game logic runs from ROM bank 2 through the slot-2 window
 BANKFLAGS := --codeseg BANK2 --constseg BANK2
-LDFLAGS := -mz80 --no-std-crt0 --data-loc 0xC000 -Wl-b_BANK2=0x28000 -Wl-u
+BANK3FLAGS := --codeseg BANK3 --constseg BANK3
+BANK4FLAGS := --codeseg BANK4 --constseg BANK4
+LDFLAGS := -mz80 --no-std-crt0 --data-loc 0xC000 -Wl-b_BANK2=0x28000 -Wl-b_BANK3=0x38000 -Wl-b_BANK4=0x48000 -Wl-u
 
-FIXED   := build/main.rel build/render.rel build/gg_world.rel build/sound.rel build/music.rel build/gg_fixed.rel
-BANKED  := build/gg_logic.rel
+FIXED   := build/main.rel build/render.rel build/gg_world.rel build/sound.rel build/music.rel build/gg_fixed.rel build/fe_fixed.rel build/bonus_fixed.rel build/mulfix.rel
+BANKED  := build/gg_logic.rel build/frontend.rel build/gg_bank3.rel build/bonus.rel build/gg_bank4.rel
 
 all: $(PROG).gg
 
-gen/gg_data.h gen/gg_fixed.c gen/data.bin: tools/convert.py tools/jjdata.py tools/psgmusic.py tools/psm.py
+gen/gg_data.h gen/gg_fixed.c gen/gg_bank3.c gen/gg_bank4.c gen/data.bin: tools/convert.py tools/jjdata.py tools/psgmusic.py tools/psm.py tools/frontend.py tools/bonus.py tools/psgsfx.py
 	python3 tools/convert.py
 
 build/%.rel: src/%.c src/*.h gen/gg_data.h | build
@@ -27,6 +29,21 @@ build/gg_fixed.rel: gen/gg_fixed.c gen/gg_data.h | build
 
 build/gg_logic.rel: src/gg_logic.c src/*.h gen/gg_data.h | build
 	$(CC) $(CFLAGS) $(BANKFLAGS) -c $< -o $@
+
+build/frontend.rel: src/frontend.c src/*.h gen/gg_data.h | build
+	$(CC) $(CFLAGS) $(BANK3FLAGS) -c $< -o $@
+
+build/gg_bank3.rel: gen/gg_bank3.c gen/gg_data.h | build
+	$(CC) $(CFLAGS) $(BANK3FLAGS) -c $< -o $@
+
+build/bonus.rel: src/bonus.c src/*.h gen/gg_data.h | build
+	$(CC) $(CFLAGS) $(BANK4FLAGS) -c $< -o $@
+
+build/gg_bank4.rel: gen/gg_bank4.c gen/gg_data.h | build
+	$(CC) $(CFLAGS) $(BANK4FLAGS) -c $< -o $@
+
+build/mulfix.rel: src/mulfix.s | build
+	sdasz80 -plosgff -o $@ $<
 
 build/crt0_sms.rel: | build
 	cp $(DEVKIT)/lib/crt0_sms.rel build/ && touch build/crt0_sms.lst
@@ -52,7 +69,10 @@ $(SMSTEST): tools/smstest/smstest.c
 	$(MAKE) -C tools/smstest
 
 test: $(PROG).gg $(SMSTEST)
-	$(SMSTEST) $(PROG).gg tests/playtest.txt
+	$(SMSTEST) $(PROG).gg tests/smoke.txt
+	tests/tour.sh
+	tests/bonus.sh
+	tests/bgstress.sh
 
 clean:
 	rm -rf build $(PROG).gg $(PROG).noi

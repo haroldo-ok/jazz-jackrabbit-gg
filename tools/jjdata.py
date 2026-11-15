@@ -64,6 +64,13 @@ def parse_file(path):
 _cache = {}
 
 
+def set_source(path):
+    """Point the loader at another episode's directory (packs/ep<N>)."""
+    global SRC
+    SRC = path
+    _cache.clear()
+
+
 def load(name):
     if name not in _cache:
         _cache[name] = parse_file(os.path.join(SRC, name))
@@ -75,7 +82,7 @@ def eventset(level):
     text = _strip(open(os.path.join(SRC, "jj1_level%d_eventset.inc" % level)).read())
     m = re.search(r"jj1_level%d_eventset\[128\]\s*=\s*(\{.*?\});" % level, text, re.S)
     table = _parse_struct_list(m.group(1), None)
-    return [table.get(i, (0, 0, 0, 0)) for i in range(128)]
+    return [tuple(table.get(i, (0, 0, 0, 0, 0))) + (0,) * (5 - len(table.get(i, (0, 0, 0, 0, 0)))) for i in range(128)]
 
 
 # Episode layout (from jj1_episode_stages.inc): stage -> world.
